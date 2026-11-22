@@ -40,7 +40,7 @@ port by the device; the device still gets VBUS. A USB-A to USB-C OTG adapter on 
 
 ESP-IDF v5.5.4 at `C:\Espressif\esp-idf`, from PowerShell in this folder:
 
-    cmd /c "set IDF_COMPONENT_CACHE_PATH=C:\Users\lmathieu\.espressif\cm_cache&& call C:\Espressif\esp-idf\export.bat && idf.py -B build\p4 -D IDF_TARGET=esp32p4 -D SDKCONFIG=build\p4\sdkconfig build"
+    cmd /c "set IDF_COMPONENT_CACHE_PATH=%USERPROFILE%\.espressif\cm_cache&& call C:\Espressif\esp-idf\export.bat && idf.py -B build\p4 -D IDF_TARGET=esp32p4 -D SDKCONFIG=build\p4\sdkconfig build"
 
 (or, in an ESP-IDF shell: `idf.py -B build\p4 -D IDF_TARGET=esp32p4 -D SDKCONFIG=build\p4\sdkconfig build`).
 The component manager fetches LVGL 9.2.2 and esp_lcd_jd9165 2.0.2. After changing `sdkconfig.defaults*`, delete
