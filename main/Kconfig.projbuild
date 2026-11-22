@@ -1,0 +1,32 @@
+menu "snoopview board"
+    config METEOBUS_P4_PANEL_V2
+        bool "Guition JC1060P470C: V2 panel (2026 batch, \"V2\" on the back label)"
+        depends on IDF_TARGET_ESP32P4
+        default y
+        help
+            Guition changed the 7" panel in 2026: a different JD9165 init table, and reset on GPIO 0 (27 before).
+            The wrong one shows a black, white or streaked screen. (Name kept from esp32-s3-meteobus's display_p4.c.)
+
+    choice SNOOPVIEW_USB_HOST_PORT
+        prompt "USB host controller (which USB-C port the device plugs into)"
+        default SNOOPVIEW_USB_HOST_HS
+        help
+            The JC1060P470C has three USB-C ports. "High speed USB" (USB3 in the schematic) is wired to the P4's
+            dedicated USB 2.0 HS pins (UTMI PHY, controller 0). "Full Speed USB" (USB2) is on GPIO 24/25, the
+            USB-Serial-JTAG's PHY (the console and flashing port). The third ("USB-TTL") is a CH340 on UART0.
+
+        config SNOOPVIEW_USB_HOST_HS
+            bool "High-speed OTG 2.0 controller, UTMI PHY (\"High speed USB\" port)"
+        config SNOOPVIEW_USB_HOST_FS
+            bool "Full-speed OTG 1.1 controller, FS PHY on GPIO 26/27 (not wired to a port on this board)"
+    endchoice
+
+    config SNOOPVIEW_USB_VBUS_EN_GPIO
+        int "GPIO that switches the host port's 5 V VBUS on (-1: none)"
+        range -1 54
+        default -1
+        help
+            The schematic ties every USB-C port's VBUS straight to the board's USB5V_IN rail (no load switch, no
+            enable pin): the host port has 5 V whenever the board is powered from USB. Set a GPIO here only for a
+            board revision that adds a switch; it is driven high before the host library starts.
+endmenu

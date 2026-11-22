@@ -1,0 +1,15 @@
+# Guition JC1060P470C: ESP32-P4 rev v1.3, 16 MB flash, 32 MB PSRAM, 7" 1024x600 JD9165 (from esp32-s3-meteobus's
+# sdkconfig.defaults.esp32p4, without esp_hosted / Wi-Fi / the app's settings).
+# The board's chip is revision v1.3: ESP-IDF 5.5.3+ targets v3.x unless told otherwise: a v3 build won't boot on v1.x.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_PM_ENABLE=n
+CONFIG_SPI_FLASH_SUPPORT_BOYA_CHIP=y
+# Weak USB supplies dip 3.3 V (MeteoBus: the amplifier; here a USB device on the host port draws from the same 5 V)
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_5=y
+# The panel: the 2026 "V2" (a JD9165 with another init table, reset on GPIO 0), as on MeteoBus's board
+CONFIG_METEOBUS_P4_PANEL_V2=y
