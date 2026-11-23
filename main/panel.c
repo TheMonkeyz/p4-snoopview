@@ -44,7 +44,17 @@
 // 5 a channel no track has, 6 no status yet / DAW mode
 enum { LIT_OFF, LIT_T1, LIT_T2, LIT_T3, LIT_T4, LIT_OTHER, LIT_PLAIN };
 static const uint32_t LIT_COL[] = {0, 0x287CFF, 0x1ECC70, 0xFFC618, 0xFF621A, 0x9A9A9A, 0xFF8000};
-#define ST_LEN      10                      // mirror_proto.h MIRROR_STATUS_LEN: flags track low bpm(2) ch[4] dawch
+// mirror_proto.h MIRROR_STATUS_LEN: flags track low bpm(2) ch[4] dawch | head plen steps(2) page dial[4] fader[4]
+// fbank master batt (the part after | from a version 3 firmware)
+#define ST_LEN      26
+#define ST_MIN      10
+
+#define STRIP_X     SIDE_W                  // the strip under the picture: 480 x 60
+#define STRIP_Y     540
+#define STRIP_BAR_Y 6
+#define STRIP_BAR_H 30
+#define STRIP_CAP_Y 40
+#define NBARS       9                       // dials 1-4, faders 1-4, the volume
 #define COL_WHITE   0xC8C8C8
 #define COL_BLACK   0x181818
 #define COL_PAD     0x2A2A2A
@@ -71,6 +81,10 @@ static uint8_t key_shown[NKEYS], pad_shown[NPADS];  // what is drawn (LVGL task)
 static volatile uint8_t note_on[128], pad_on[NPADS];
 static volatile uint8_t base = BASE_DEF, last[3], last_new;
 static volatile uint8_t stat[ST_LEN], stat_have, stat_new;   // the keyboard's 'S' record
+static volatile uint8_t stat_len;                   // how much of it the keyboard sent
+static lv_obj_t *strip, *step_obj[16], *bar_fill[NBARS], *bat_obj[3], *cap_steps, *cap_fad;
+static uint32_t step_col[16];
+static int bar_h[NBARS];
 static uint8_t base_shown = 0xFF;
 
 static lv_obj_t *box(lv_obj_t *parent, int x, int y, int w, int h, uint32_t col)
@@ -130,6 +144,82 @@ static void chord_name(char *dst, size_t n, uint16_t mask, int bass)
                 return;
             }
     }
+}
+
+// The strip under the picture, from the status record's second part. LVGL task.
+static void strip_update(bool have)
+{
+    static const char *const BANK[4] = {"FAD LVL", "FAD FLT", "FAD REV", "FAD DLY"};
+    char s[24];
+    if (!have) {
+        lv_obj_add_flag(strip, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(strip, LV_OBJ_FLAG_HIDDEN);
+    uint8_t trk = stat[1] & 3, head = stat[10], plen = stat[11], page = stat[14];
+    unsigned mask = stat[12] | (unsigned)stat[13] << 8;
+    for (int i = 0; i < 16; i++) {
+        uint32_t c = i >= plen ? 0x101010 : i == head ? 0xFFFFFF : ((mask >> i) & 1) ? LIT_COL[LIT_T1 + trk] : 0x383838;
+        if (c != step_col[i]) {
+            step_col[i] = c;
+            lv_obj_set_style_bg_color(step_obj[i], lv_color_hex(c), 0);
+        }
+    }
+    snprintf(s, sizeof s, "STEPS %d - %d", page * 16 + 1, page * 16 + 16);
+    lv_label_set_text(cap_steps, s);
+    lv_label_set_text(cap_fad, BANK[stat[23] & 3]);
+    for (int i = 0; i < NBARS; i++) {
+        uint8_t v = i < 4 ? stat[15 + i] : i < 8 ? stat[19 + (i - 4)] : stat[24];
+        int h = v > 127 ? -1 : 1 + v * (STRIP_BAR_H - 1) / 127;     // (0 still shows a line; -1: no value here)
+        if (h == bar_h[i])
+            continue;
+        bar_h[i] = h;
+        if (h < 0) {
+            lv_obj_add_flag(bar_fill[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(bar_fill[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_height(bar_fill[i], h);
+            lv_obj_set_y(bar_fill[i], STRIP_BAR_H - h);
+        }
+    }
+    for (int i = 0; i < 3; i++)
+        lv_obj_set_style_bg_color(bat_obj[i], lv_color_hex(i < (stat[25] & 3) ? 0x30E060 : 0x303030), 0);
+}
+
+// One vertical bar of the strip: a dark track at x, and in it the fill strip_update() sizes
+static lv_obj_t *strip_bar(int x, uint32_t col)
+{
+    lv_obj_t *track = box(strip, x, STRIP_BAR_Y, 10, STRIP_BAR_H, 0x202020);
+    return box(track, 0, STRIP_BAR_H - 1, 10, 1, col);
+}
+
+static void strip_init(lv_obj_t *scr)
+{
+    strip = lv_obj_create(scr);
+    lv_obj_remove_style_all(strip);
+    lv_obj_set_pos(strip, STRIP_X, STRIP_Y);
+    lv_obj_set_size(strip, 480, 60);
+    lv_obj_remove_flag(strip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < 16; i++) {
+        step_obj[i] = box(strip, 4 + i * 15, STRIP_BAR_Y, 12, STRIP_BAR_H, 0x383838);
+        lv_obj_set_style_radius(step_obj[i], 2, 0);
+        step_col[i] = 0x383838;
+    }
+    cap_steps = text(strip, 4, STRIP_CAP_Y, 240, &lv_font_montserrat_14, COL_DIM, "STEPS");
+    for (int i = 0; i < 4; i++) {                   // the dials and the faders: SLOOP's four colours
+        bar_fill[i] = strip_bar(256 + i * 15, LIT_COL[LIT_T1 + i]);
+        bar_fill[4 + i] = strip_bar(326 + i * 15, LIT_COL[LIT_T1 + i]);
+    }
+    bar_fill[8] = strip_bar(404, 0xFFFFFF);
+    for (int i = 0; i < NBARS; i++)
+        bar_h[i] = 1;
+    text(strip, 256, STRIP_CAP_Y, 66, &lv_font_montserrat_14, COL_DIM, "DIALS");
+    cap_fad = text(strip, 326, STRIP_CAP_Y, 70, &lv_font_montserrat_14, COL_DIM, "FAD");
+    text(strip, 398, STRIP_CAP_Y, 36, &lv_font_montserrat_14, COL_DIM, "VOL");
+    for (int i = 0; i < 3; i++)
+        bat_obj[i] = box(strip, 438 + i * 12, STRIP_BAR_Y + 10, 10, 16, 0x303030);
+    text(strip, 438, STRIP_CAP_Y, 40, &lv_font_montserrat_14, COL_DIM, "BAT");
+    lv_obj_add_flag(strip, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void roll_changed(void)
@@ -234,6 +324,7 @@ static void tick(lv_timer_t *t)
             lv_label_set_text(bar_run, (f & 4) ? "REC" : (f & 2) ? "PLAY" : "STOP");
             lv_obj_set_style_text_color(bar_run, lv_color_hex((f & 4) ? 0xFF3030 : (f & 2) ? 0x30E060 : COL_DIM), 0);
         }
+        strip_update(have && stat_len >= ST_LEN);
     }
     if (last_new) {
         char s[48], nm[8];
@@ -414,6 +505,7 @@ void panel_init(void)
     bar_bpm = text(scr, BAR_X + 250, BAR_Y, 110, &lv_font_montserrat_20, 0xFFFFFF, "");
     bar_run = text(scr, BAR_X + 390, BAR_Y, 82, &lv_font_montserrat_20, COL_DIM, "");
     lv_obj_set_style_text_align(bar_run, LV_TEXT_ALIGN_RIGHT, 0);
+    strip_init(scr);
     stat_new = 1;                                   // (hides them)
     lv_timer_create(tick, 30, NULL);
     display_unlock();
@@ -430,10 +522,13 @@ void panel_set_connected(bool on)
     stat_new = 1;
 }
 
-void panel_status(const uint8_t *s)
+void panel_status(const uint8_t *s, int len)
 {
+    if (len < ST_MIN)
+        return;
     for (int i = 0; i < ST_LEN; i++)
         stat[i] = s[i];
+    stat_len = (uint8_t)(len > ST_LEN ? ST_LEN : len);
     stat_have = 1;
     stat_new = 1;
     int b = (s[2] & 127) / 12 * 12;                 // the piano starts on a C: the one at or under the lowest key

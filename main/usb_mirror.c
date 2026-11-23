@@ -133,7 +133,7 @@ static void iso_cb(usb_transfer_t *t)
         if (res & MD_RESYNC)
             want_resync = true;
         if (res & MD_STATUS)
-            panel_status(dec->status);
+            panel_status(dec->status, dec->status_len);
         if (res & MD_FRAME) {
             int x, y, w, h;
             st.frames++;

@@ -9,6 +9,7 @@ void panel_init(void);                      // after view_init(); takes display_
 // it only records state, an LVGL timer draws it.
 void panel_midi(uint8_t status, uint8_t d1, uint8_t d2);
 void panel_set_connected(bool on);          // off: every key and pad goes dark. Any task; no lock taken
-// The keyboard's status record (mirror_proto.h 'S', MIRROR_STATUS_LEN bytes): the track colours, the piano's
-// octave and the status bar over the picture. Any task; no lock taken.
-void panel_status(const uint8_t *s);
+// The keyboard's status record (mirror_proto.h 'S': MIRROR_STATUS_LEN bytes, the first len of them sent by the
+// keyboard, the rest 0): the track colours, the piano's octave, the status bar over the picture and, from a
+// version 3 firmware, the strip under it (steps, dials, faders, volume, battery). Any task; no lock taken.
+void panel_status(const uint8_t *s, int len);
