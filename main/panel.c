@@ -185,13 +185,24 @@ static void cheat_sheet(lv_obj_t *scr)
         "\n"
         "[ FADERS ]\n"
         "FADER 1 - 4\n"
-        "BANK A B C D\n"
+        "BANK A B C D";
+    // Two buttons pressed together: the names are too long for the left column, so each combo has a full-width
+    // line for its buttons (grey) and one under it for what it does (white).
+    static const char COMBO_KEYS[] =
+        "[ PRESS BOTH TOGETHER ]\n"
+        "<  and  >\n"
         "\n"
-        "[ COMBOS ]\n"
-        "< + >\n"
-        "KNOB+FADER BK\n"
-        "PATCH + OCT+\n"
-        "OCT- + OCT+";
+        "KNOB BANK and FADER BANK\n"
+        "\n"
+        "PATCH (hold) and OCTAVE+\n";
+    static const char COMBO_DOES[] =
+        "\n"
+        "\n"
+        "   switch SYNTH / DAW mode\n"
+        "\n"
+        "   pads play DRUMS or set STEPS\n"
+        "\n"
+        "   edit the DAW map (DAW mode)";
     static const char SLOOP[] =
         "\n"
         "PLAY\n"
@@ -215,16 +226,18 @@ static void cheat_sheet(lv_obj_t *scr)
         "\n"
         "\n"
         "TRACK 1 - 4\n"
-        "LVL FLT REV DLY\n"
-        "\n"
-        "\n"
-        "SYNTH - DAW\n"
-        "PADS KIT - STEPS\n"
-        "DAW MAP EDIT\n"
-        "CALIB (POWER-ON)";
+        "LVL FLT REV DLY";
     text(scr, 12, 16, SIDE_W - 16, &lv_font_montserrat_20, 0xFFFFFF, "SMK-37  >  SLOOP");
-    text(scr, 12, 56, 118, &lv_font_montserrat_14, COL_DIM, PRINTED);
-    text(scr, 132, 56, SIDE_W - 136, &lv_font_montserrat_14, 0xFFFFFF, SLOOP);
+    lv_obj_t *col = text(scr, 12, 50, 118, &lv_font_montserrat_14, COL_DIM, PRINTED);
+    lv_obj_t *col2 = text(scr, 132, 50, SIDE_W - 136, &lv_font_montserrat_14, 0xFFFFFF, SLOOP);
+    lv_obj_t *keys = text(scr, 12, 0, SIDE_W - 16, &lv_font_montserrat_14, COL_DIM, COMBO_KEYS);
+    lv_obj_t *does = text(scr, 12, 0, SIDE_W - 16, &lv_font_montserrat_14, 0xFFFFFF, COMBO_DOES);
+    lv_obj_t *all[4] = {col, col2, keys, does};
+    for (int i = 0; i < 4; i++)                     // 30 lines in 550 px: one pixel between the lines
+        lv_obj_set_style_text_line_space(all[i], 1, 0);
+    lv_obj_update_layout(scr);
+    lv_obj_align_to(keys, col, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
+    lv_obj_align_to(does, col, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 12);
 }
 
 static void piano(lv_obj_t *scr)
