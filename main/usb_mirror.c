@@ -16,6 +16,7 @@
 #include "sdkconfig.h"
 #include "mirror_decode.h"
 #include "view.h"
+#include "panel.h"
 #include "usb_mirror.h"
 
 #define SNOOP_VID 0x1209
@@ -48,8 +49,17 @@ static usb_transfer_t *iso[ISO_XFERS], *ctrl;
 static bool ctrl_busy, want_resync;
 static mirror_dec_t *dec;
 static struct {
-    uint32_t pkts, bytes, empty, errs, frames, resyncs;
+    uint32_t pkts, bytes, empty, errs, frames, resyncs, midi;
 } st;
+
+/* the keyboard's USB MIDI (interface class 1, subclass 3: a bulk IN endpoint), for the side panels (panel.c).
+ * Optional: without it the mirror runs alone. */
+#define MIDI_ERR_MAX 10             /* failed transfers in a row: stop asking */
+static int midi_if = -1;            /* the claimed interface (-1: none) */
+static uint8_t midi_ep, midi_errs;
+static uint16_t midi_mps;
+static usb_transfer_t *midi_x;
+static bool midi_busy;
 
 static void client_cb(const usb_host_client_event_msg_t *msg, void *arg)
 {
@@ -122,6 +132,8 @@ static void iso_cb(usb_transfer_t *t)
         }
         if (res & MD_RESYNC)
             want_resync = true;
+        if (res & MD_STATUS)
+            panel_status(dec->status);
         if (res & MD_FRAME) {
             int x, y, w, h;
             st.frames++;
@@ -156,10 +168,75 @@ static bool find_mirror(const usb_config_desc_t *cfg)
     return false;
 }
 
+/* the MIDI streaming interface's number, bulk IN endpoint and packet size */
+static bool find_midi(const usb_config_desc_t *cfg, uint8_t *num)
+{
+    int off = 0;
+    const usb_standard_desc_t *d = (const usb_standard_desc_t *)cfg;
+    bool in_if = false;
+    while ((d = usb_parse_next_descriptor(d, cfg->wTotalLength, &off)) != NULL) {
+        if (d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
+            const usb_intf_desc_t *f = (const usb_intf_desc_t *)d;
+            in_if = f->bInterfaceClass == 0x01 && f->bInterfaceSubClass == 0x03 && f->bAlternateSetting == 0;
+            if (in_if)
+                *num = f->bInterfaceNumber;
+        } else if (in_if && d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+            const usb_ep_desc_t *e = (const usb_ep_desc_t *)d;
+            if ((e->bEndpointAddress & 0x80) && (e->bmAttributes & 3) == 2) {
+                midi_ep = e->bEndpointAddress;
+                midi_mps = e->wMaxPacketSize & 0x7FF;
+                return midi_mps >= 4;
+            }
+        }
+    }
+    return false;
+}
+
+static void midi_submit(void)
+{
+    if (!running || gone || !midi_x || midi_busy || midi_errs >= MIDI_ERR_MAX)
+        return;
+    midi_x->num_bytes = midi_mps;
+    if (usb_host_transfer_submit(midi_x) == ESP_OK) {
+        midi_busy = true;
+        in_flight++;
+    } else {
+        midi_errs++;
+    }
+}
+
+/* USB-MIDI event packets, 4 bytes each: the code index (low nibble of byte 0), then the MIDI message */
+static void midi_cb(usb_transfer_t *t)
+{
+    int i;
+    midi_busy = false;
+    in_flight--;
+    if (t->status == USB_TRANSFER_STATUS_COMPLETED) {
+        midi_errs = 0;
+        for (i = 0; i + 4 <= t->actual_num_bytes; i += 4) {
+            const uint8_t *p = t->data_buffer + i;
+            uint8_t cin = p[0] & 15;
+            if (cin == 0x8 || cin == 0x9 || cin == 0xB || cin == 0xE) {
+                st.midi++;
+                panel_midi(p[1], p[2], p[3]);
+            }
+        }
+    } else if (running && !gone) {
+        if (++midi_errs == MIDI_ERR_MAX)
+            ESP_LOGW(TAG, "MIDI: the endpoint keeps failing (%d): the panels stay dark", (int)t->status);
+    }
+    midi_submit();
+}
+
 static void dev_close(void)
 {
     int i;
     running = false;
+    /* a bulk read waits for ever while the keyboard is still there: take it back */
+    if (dev && midi_busy && !gone) {
+        usb_host_endpoint_halt(dev, midi_ep);
+        usb_host_endpoint_flush(dev, midi_ep);
+    }
     /* the library still holds transfers: it gives them back (cancelled / no device) through the callbacks */
     for (i = 0; in_flight > 0 && i < 200; i++)
         usb_host_client_handle_events(client, pdMS_TO_TICKS(10));
@@ -174,6 +251,14 @@ static void dev_close(void)
         usb_host_transfer_free(ctrl);
         ctrl = NULL;
     }
+    if (midi_x) {
+        usb_host_transfer_free(midi_x);
+        midi_x = NULL;
+    }
+    midi_busy = false;
+    if (dev && midi_if >= 0)
+        usb_host_interface_release(client, dev, (uint8_t)midi_if);
+    midi_if = -1;
     if (dev) {
         usb_host_interface_release(client, dev, ifnum);
         usb_host_device_close(client, dev);
@@ -244,6 +329,29 @@ static void dev_open(uint8_t addr)
     view_set_connected(true);
     ESP_LOGI(TAG, "Snoop37 %x.%02x: interface %d, endpoint %02x, %d bytes per ms", dd->bcdDevice >> 8, dd->bcdDevice & 0xFF,
              ifnum, ep_addr, ep_mps);
+    /* the MIDI interface, for the side panels: the mirror runs without it */
+    {
+        uint8_t n = 0;
+        midi_errs = 0;
+        if (!find_midi(cfg, &n)) {
+            ESP_LOGW(TAG, "no MIDI interface: the keys and pads panel stays dark");
+        } else if (usb_host_interface_claim(client, dev, n, 0) != ESP_OK) {
+            ESP_LOGW(TAG, "MIDI interface %d: claim failed", n);
+        } else {
+            midi_if = n;
+            if (usb_host_transfer_alloc(midi_mps, 0, &midi_x) == ESP_OK) {
+                midi_x->device_handle = dev;
+                midi_x->bEndpointAddress = midi_ep;
+                midi_x->callback = midi_cb;
+                midi_x->context = NULL;
+                midi_submit();
+                ESP_LOGI(TAG, "MIDI: interface %d, endpoint %02x, %d bytes", n, midi_ep, midi_mps);
+            } else {
+                midi_x = NULL;
+                ESP_LOGW(TAG, "MIDI: no memory for the transfer");
+            }
+        }
+    }
     return;
 fail:
     ESP_LOGE(TAG, "could not start the stream");
@@ -280,9 +388,9 @@ static void client_task(void *arg)
         }
         if (running && xTaskGetTickCount() - last >= pdMS_TO_TICKS(5000)) {
             last = xTaskGetTickCount();
-            ESP_LOGI(TAG, "%u packets, %u bytes, %u frames, %u empty, lost %u, bad %u, resyncs %u", (unsigned)st.pkts,
+            ESP_LOGI(TAG, "%u packets, %u bytes, %u frames, %u empty, lost %u, bad %u, resyncs %u, midi %u", (unsigned)st.pkts,
                      (unsigned)st.bytes, (unsigned)st.frames, (unsigned)st.empty, (unsigned)dec->lost, (unsigned)dec->bad,
-                     (unsigned)st.resyncs);
+                     (unsigned)st.resyncs, (unsigned)st.midi);
         }
     }
 }

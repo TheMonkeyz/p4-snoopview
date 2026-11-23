@@ -3,6 +3,7 @@
 // no cache write-back is needed after the copy); only the copied area is invalidated.
 #include <string.h>
 #include "view.h"
+#include "panel.h"
 #include "display.h"
 #include "lvgl.h"
 #include "esp_heap_caps.h"
@@ -74,6 +75,7 @@ static void invalidate_img_area(int x, int y, int w, int h)
 
 void view_set_connected(bool on)
 {
+    panel_set_connected(on);
     display_lock(-1);
     if (on) {
         lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
