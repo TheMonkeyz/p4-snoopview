@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "panel.h"
+#include "touch.h"
+#include "usb_mirror.h"
 #include "display.h"
 #include "lvgl.h"
 #include "esp_heap_caps.h"
@@ -45,8 +47,10 @@
 enum { LIT_OFF, LIT_T1, LIT_T2, LIT_T3, LIT_T4, LIT_OTHER, LIT_PLAIN };
 static const uint32_t LIT_COL[] = {0, 0x287CFF, 0x1ECC70, 0xFFC618, 0xFF621A, 0x9A9A9A, 0xFF8000};
 // mirror_proto.h MIRROR_STATUS_LEN: flags track low bpm(2) ch[4] dawch | head plen steps(2) page dial[4] fader[4]
-// fbank master batt | scale(2) root bend mod (the parts after the first | from a version 3 firmware)
+// fbank master batt | scale(2) root bend mod (the parts after the first | from a version 3 firmware, as far as
+// it sends them)
 #define ST_LEN      31
+#define ST_SCALE    31                      // the scale and the wheels are there from this length on
 #define ST_STRIP    26                      // the strip's part is there from this length on
 #define ST_MIN      10
 
@@ -91,6 +95,42 @@ static volatile uint8_t act;                        // something was played or c
 static volatile unsigned link_fps, link_lost;
 static volatile uint8_t link_new;
 static lv_obj_t *key_dot[NKEYS], *lbl_link, *lbl_scale;
+// The left side's two pages: the cheat sheet and the song page. A tap on the title line (the top PAGE_TAP_H
+// pixels) changes the page; on the song page the other taps are its buttons.
+#define PAGE_TAP_H  46
+#define LY_SONG     7                       // sloop-fm1 seq.c: the SAVE layer, whose keys the song page presses
+enum { SB_PLAY, SB_REC, SB_PART, SB_SAVE = SB_PART + 4, SB_SREC = SB_SAVE + 4, SB_LOOP, SB_SONG, SB_UNDO, SB_COUNT,
+       // the SONG EDIT page's buttons, in the same table
+       EB_PREV = SB_COUNT, EB_NEXT, EB_PART, EB_M4 = EB_PART + 4, EB_M1, EB_P1, EB_P4, EB_ADD, EB_DEL, EB_SAVE, EB_COUNT };
+enum { PG_CHEAT, PG_SONG, PG_EDIT, PG_COUNT };
+#define ED_SONG     100                     // usb_mirror.h: the song order command
+#define SONG_STEPS  16
+#define SONG_LEN    (3 + 2 * SONG_STEPS)    // its reply: op rc count, then 16 x (part, bars)
+typedef struct {
+    int16_t x, y, w, h;
+    lv_obj_t *box, *lab;
+    uint32_t bg, fg;                        // as drawn
+    char txt[16];
+} sbtn_t;
+static sbtn_t sb[EB_COUNT];
+static lv_obj_t *page_obj[PG_COUNT], *song_help, *song_info;
+static int page;                                    // the left side's page, PG_*
+static bool touch_was;
+// the SONG EDIT page
+static lv_obj_t *edit_help, *edit_info, *cell_box[SONG_STEPS], *cell_lab[SONG_STEPS];
+static volatile uint8_t songd[SONG_LEN], song_new;
+static int song_age = 1000, edit_sel, edit_ask;     // ticks since the last order read; the line picked; ticks to the next read
+static int cell_state[SONG_STEPS];                  // what a cell shows, packed (edit_update)
+static char edit_help_shown[160], edit_info_shown[64], edit_note[64];
+static int flash_btn = -1, flash_ticks;             // the button just tapped: a white frame for a moment
+static int save_armed = -1, save_ticks;             // SAVE tapped on a used part: the second tap replaces it
+// the keyboard's live state (editor_live.c ed_live): op flags flags2 bpm(2) playing+1 asked+1 chain_n chain_i mutes
+// solos rec sel fx cpu song_entry song_entries song_bar song_bars stored ...
+#define LIVE_LEN    20
+static volatile uint8_t live[LIVE_LEN], live_new;
+static int live_age = 1000;                         // ticks since the last one (more than LIVE_OLD: none)
+#define LIVE_OLD    50
+static char help_shown[160], info_shown[64];
 static uint8_t dot_shown[NKEYS];                    // 0 hidden, 1 in the scale, 2 its root
 static int idle_ticks;
 static bool dimmed;
@@ -182,7 +222,7 @@ static void strip_update(bool have)
     lv_label_set_text(cap_fad, BANK[stat[23] & 3]);
     for (int i = 0; i < NBARS; i++) {
         uint8_t v = i < 4 ? stat[15 + i] : i < 8 ? stat[19 + (i - 4)] : i == 8 ? stat[24] :
-                    stat_len >= ST_LEN ? stat[29 + (i - 9)] : 0xFF;
+                    stat_len >= ST_SCALE ? stat[29 + (i - 9)] : 0xFF;
         // h: 1..30 from the bottom (0 still shows a line), -1 no value here. The pitch wheel: from the middle,
         // up or down; kept as 1000 + its value so a change is seen.
         int h = v > 127 ? -1 : i == BAR_PITCH ? 1000 + v : 1 + v * (STRIP_BAR_H - 1) / 127;
@@ -234,6 +274,307 @@ static void scale_update(bool have)
             lv_obj_set_style_bg_color(key_dot[i], lv_color_hex(want == 2 ? 0xFF2020 : key_black[i] ? 0xB0B0B0 : 0x505050), 0);
         }
     }
+}
+
+// ---- the song page: SLOOP's song recording with buttons to tap (the keyboard does the work: usb_mirror_live) ----
+static void live_key(int key)               // a key of the SAVE layer, down and up: editor_live.c op 2
+{
+    uint8_t d[4] = {2, LY_SONG, (uint8_t)key, 1};
+    usb_mirror_live(d, 4);
+    d[3] = 0;
+    usb_mirror_live(d, 4);
+}
+
+static void song_tap(int b)
+{
+    uint8_t d[2];
+    flash_btn = b;
+    flash_ticks = 8;
+    if (b == SB_PLAY) {
+        d[0] = 1; d[1] = 2;                 // as the PLAY button
+        usb_mirror_live(d, 2);
+    } else if (b == SB_REC) {
+        d[0] = 4; d[1] = 0;                 // as the REC button
+        usb_mirror_live(d, 2);
+    } else if (b == SB_UNDO) {
+        d[0] = 5; d[1] = 0;
+        usb_mirror_live(d, 2);
+    } else if (b >= SB_PART && b < SB_PART + 4) {
+        live_key(b - SB_PART);              // play it at the next bar (stopped: load it)
+    } else if (b >= SB_SAVE && b < SB_SAVE + 4) {
+        int i = b - SB_SAVE;
+        bool used = live_age <= LIVE_OLD && ((live[19] >> i) & 1);
+        // the keyboard itself wants a second tap within 3 s before it replaces a used part: say so here
+        if (used && save_armed != i) {
+            save_armed = i;
+            save_ticks = 100;
+        } else {
+            save_armed = -1;
+        }
+        live_key(4 + i);
+    } else if (b == SB_SREC) {
+        live_key(13);
+    } else if (b == SB_LOOP || b == SB_SONG) {
+        bool song_mode = live_age <= LIVE_OLD && (live[1] & 4);
+        if ((b == SB_SONG) != song_mode)
+            live_key(12);                   // (it toggles)
+    }
+}
+
+static void sb_set(int i, uint32_t bg, uint32_t fg, const char *txt)
+{
+    sbtn_t *b = &sb[i];
+    if (b->bg != bg) {
+        b->bg = bg;
+        lv_obj_set_style_bg_color(b->box, lv_color_hex(bg), 0);
+    }
+    if (b->fg != fg) {
+        b->fg = fg;
+        lv_obj_set_style_text_color(b->lab, lv_color_hex(fg), 0);
+    }
+    if (txt && strcmp(b->txt, txt)) {
+        snprintf(b->txt, sizeof b->txt, "%s", txt);
+        lv_label_set_text(b->lab, txt);
+    }
+}
+
+// The buttons, the help line and the info line from the live state. LVGL task, every tick while the page shows.
+static void song_update(void)
+{
+    bool have = live_age <= LIVE_OLD;
+    uint8_t f = have ? live[1] : 0, f2 = have ? live[2] : 0, stored = have ? live[19] & 15 : 0;
+    bool playing = f & 1, song_mode = f & 4, song_plays = f & 8, srec = f & 64;
+    bool rec = have && ((live[11] & 15) || (f2 & 1));
+    int now = have ? live[5] - 1 : -1, next = have ? live[6] - 1 : -1, nstored = __builtin_popcount(stored);
+    char help[160], info[64], t[16];
+    static const char *const PART[4] = {"A", "B", "C", "D"};
+
+    sb_set(SB_PLAY, playing ? 0x30E060 : 0x3A3A3A, playing ? 0x000000 : 0xFFFFFF, playing ? "STOP" : "PLAY");
+    sb_set(SB_REC, rec ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, rec ? "REC ON" : "REC");
+    for (int i = 0; i < 4; i++) {
+        bool used = (stored >> i) & 1;
+        sb_set(SB_PART + i, !used ? 0x242424 : i == now ? LIT_COL[LIT_T1 + i] : 0x2A3A4A, !used ? 0x606060 : i == now ? 0x000000 : 0xFFFFFF, NULL);
+        lv_obj_set_style_border_width(sb[SB_PART + i].box, i == next || flash_btn == SB_PART + i ? 3 : 0, 0);
+        snprintf(t, sizeof t, save_armed == i ? "%s ?" : "%s", PART[i]);
+        sb_set(SB_SAVE + i, save_armed == i ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, t);
+    }
+    sb_set(SB_SREC, srec ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, srec ? "STOP SONG REC" : "SONG REC");
+    sb_set(SB_LOOP, !song_mode ? 0xFFFFFF : 0x3A3A3A, !song_mode ? 0x000000 : 0xFFFFFF, NULL);
+    sb_set(SB_SONG, song_mode ? 0xFFFFFF : 0x3A3A3A, song_mode ? 0x000000 : 0xFFFFFF, NULL);
+    for (int i = 0; i < SB_COUNT; i++)
+        if (i < SB_PART || i >= SB_PART + 4)
+            lv_obj_set_style_border_width(sb[i].box, flash_btn == i ? 3 : 0, 0);
+
+    // what to do next, in plain words
+    if (!have)
+        snprintf(help, sizeof help, "Waiting for the keyboard...");
+    else if (save_armed >= 0)
+        snprintf(help, sizeof help, "Part %s is used. Tap SAVE %s again now to replace it. This cannot be undone.", PART[save_armed], PART[save_armed]);
+    else if (srec && playing)
+        snprintf(help, sizeof help, "Recording the song. Tap the parts in the order you want. Tap STOP SONG REC to finish.");
+    else if (srec)
+        snprintf(help, sizeof help, "SONG REC is ready. Tap PLAY, then tap the parts in the order you want.");
+    else if (song_mode)
+        snprintf(help, sizeof help, playing ? "The song plays. Tap STOP to end it." : "SONG mode: tap PLAY to hear your song. Tap LOOP to work on the parts.");
+    else if (!nstored)
+        snprintf(help, sizeof help, "1. Play your loop (REC records your notes).  2. Tap STOP.  3. Tap SAVE LOOP AS: A.");
+    else if (nstored == 1)
+        snprintf(help, sizeof help, "Change the loop, tap STOP and save it as the next part. With 2 parts or more: tap PLAY, then SONG REC.");
+    else
+        snprintf(help, sizeof help, playing ? "Tap a part: it starts at the next bar. Tap SONG REC to record the order as a song."
+                                            : "Tap PLAY. Then tap SONG REC and tap the parts in the order you want.");
+    if (strcmp(help, help_shown)) {
+        snprintf(help_shown, sizeof help_shown, "%s", help);
+        lv_label_set_text(song_help, help);
+    }
+    if (!have)
+        info[0] = 0;
+    else if (song_plays)
+        snprintf(info, sizeof info, "song: part %d of %d, bar %d of %d", live[15] + 1, live[16], live[17] + 1, live[18]);
+    else if (now >= 0 && next >= 0 && next != now)
+        snprintf(info, sizeof info, "playing %s, next %s", PART[now & 3], PART[next & 3]);
+    else if (now >= 0)
+        snprintf(info, sizeof info, "playing part %s", PART[now & 3]);
+    else
+        snprintf(info, sizeof info, "%d of 4 parts saved", nstored);
+    if (strcmp(info, info_shown)) {
+        snprintf(info_shown, sizeof info_shown, "%s", info);
+        lv_label_set_text(song_info, info);
+    }
+}
+
+static void sb_make(lv_obj_t *pg, int i, int x, int y, int w, int h, const char *txt, const lv_font_t *font)
+{
+    sbtn_t *b = &sb[i];
+    b->x = (int16_t)x; b->y = (int16_t)y; b->w = (int16_t)w; b->h = (int16_t)h;
+    b->bg = 0x3A3A3A;
+    b->fg = 0xFFFFFF;
+    b->box = box(pg, x, y, w, h, b->bg);
+    lv_obj_set_style_radius(b->box, 6, 0);
+    lv_obj_set_style_border_color(b->box, lv_color_white(), 0);
+    b->lab = lv_label_create(b->box);
+    lv_obj_set_style_text_font(b->lab, font, 0);
+    lv_obj_set_style_text_color(b->lab, lv_color_white(), 0);
+    snprintf(b->txt, sizeof b->txt, "%s", txt);
+    lv_label_set_text(b->lab, txt);
+    lv_obj_center(b->lab);
+}
+
+static void song_init(lv_obj_t *pg)
+{
+    static const char *const PART[4] = {"A", "B", "C", "D"};
+    text(pg, 12, 16, 80, &lv_font_montserrat_20, 0xFFFFFF, "SONG");
+    text(pg, 96, 20, SIDE_W - 100, &lv_font_montserrat_14, 0x606060, "tap here: edit the song");
+    song_help = text(pg, 12, 50, SIDE_W - 24, &lv_font_montserrat_14, 0xFFC618, "");
+    lv_label_set_long_mode(song_help, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(song_help, 70);
+    sb_make(pg, SB_PLAY, 12, 126, 120, 56, "PLAY", &lv_font_montserrat_20);
+    sb_make(pg, SB_REC, 140, 126, 120, 56, "REC", &lv_font_montserrat_20);
+    text(pg, 12, 194, SIDE_W - 24, &lv_font_montserrat_14, COL_DIM, "PARTS   tap to play");
+    text(pg, 12, 290, SIDE_W - 24, &lv_font_montserrat_14, COL_DIM, "SAVE LOOP AS");
+    for (int i = 0; i < 4; i++) {
+        sb_make(pg, SB_PART + i, 12 + i * 63, 214, 59, 64, PART[i], &lv_font_montserrat_20);
+        sb_make(pg, SB_SAVE + i, 12 + i * 63, 310, 59, 46, PART[i], &lv_font_montserrat_20);
+    }
+    sb_make(pg, SB_SREC, 12, 372, 248, 56, "SONG REC", &lv_font_montserrat_20);
+    sb_make(pg, SB_LOOP, 12, 440, 120, 48, "LOOP", &lv_font_montserrat_20);
+    sb_make(pg, SB_SONG, 140, 440, 120, 48, "SONG", &lv_font_montserrat_20);
+    sb_make(pg, SB_UNDO, 12, 500, 120, 44, "UNDO", &lv_font_montserrat_20);
+    song_info = text(pg, 12, 560, SIDE_W - 24, &lv_font_montserrat_14, 0xFFFFFF, "");
+}
+
+// ---- the SONG EDIT page: the song order, a line at a time (the keyboard holds it: usb_mirror_cmd ED_SONG) ----
+static void edit_cmd(int op, int a, int b, int c)
+{
+    uint8_t d[4] = {(uint8_t)op, (uint8_t)a, (uint8_t)b, (uint8_t)c};
+    usb_mirror_cmd(ED_SONG, d, op == 1 ? 4 : op == 0 || op == 4 ? 1 : 2);
+}
+
+static void edit_tap(int b)
+{
+    int count = songd[2] ? songd[2] : 1, part = songd[3 + 2 * edit_sel] & 3, bars = songd[4 + 2 * edit_sel];
+    static const int STEP[4] = {-4, -1, 1, 4};
+    flash_btn = b;
+    flash_ticks = 8;
+    edit_note[0] = 0;
+    if (song_age > LIVE_OLD)
+        return;
+    if (b == EB_PREV) {
+        if (edit_sel > 0) edit_sel--;
+    } else if (b == EB_NEXT) {
+        if (edit_sel < count - 1) edit_sel++;
+    } else if (b >= EB_PART && b < EB_PART + 4) {
+        edit_cmd(1, edit_sel, b - EB_PART, bars);
+    } else if (b >= EB_M4 && b <= EB_P4) {
+        int v = bars + STEP[b - EB_M4];
+        edit_cmd(1, edit_sel, part, v < 1 ? 1 : v > 64 ? 64 : v);
+    } else if (b == EB_ADD) {
+        edit_cmd(2, edit_sel, 0, 0);
+    } else if (b == EB_DEL) {
+        edit_cmd(3, edit_sel, 0, 0);
+    } else if (b == EB_SAVE) {
+        edit_cmd(4, 0, 0, 0);
+    }
+}
+
+static void sb_set(int i, uint32_t bg, uint32_t fg, const char *txt);
+
+static void edit_update(void)
+{
+    static const char *const PART[4] = {"A", "B", "C", "D"};
+    bool have = song_age <= LIVE_OLD, live_ok = live_age <= LIVE_OLD;
+    bool playing = live_ok && (live[1] & 1), song_plays = live_ok && (live[1] & 8);
+    int count = have ? songd[2] : 0, total = 0;
+    char help[160], info[64];
+    if (edit_sel >= count) edit_sel = count ? count - 1 : 0;
+    for (int i = 0; i < SONG_STEPS; i++) {
+        int part = songd[3 + 2 * i] & 3, bars = songd[4 + 2 * i];
+        bool used = i < count, sel = used && i == edit_sel, now = used && song_plays && live[15] == i;
+        int st = !used ? 0 : 1 + part + 4 * bars + 1024 * sel + 2048 * now;
+        if (i < count) total += bars;
+        if (st == cell_state[i])
+            continue;
+        cell_state[i] = st;
+        if (!used) {
+            lv_label_set_text(cell_lab[i], "");
+            lv_obj_set_style_bg_color(cell_box[i], lv_color_hex(0x000000), 0);
+            continue;
+        }
+        lv_label_set_text_fmt(cell_lab[i], "%d   %s   %d bar%s%s", i + 1, PART[part], bars, bars == 1 ? "" : "s", now ? "  <" : "");
+        lv_obj_set_style_bg_color(cell_box[i], lv_color_hex(sel ? 0xFFFFFF : 0x1C1C1C), 0);
+        lv_obj_set_style_text_color(cell_lab[i], lv_color_hex(sel ? 0x000000 : LIT_COL[LIT_T1 + part]), 0);
+    }
+    for (int i = 0; i < 4; i++) {
+        bool on = have && count && (songd[3 + 2 * edit_sel] & 3) == i;
+        sb_set(EB_PART + i, on ? LIT_COL[LIT_T1 + i] : 0x3A3A3A, on ? 0x000000 : 0xFFFFFF, NULL);
+    }
+    for (int i = EB_PREV; i < EB_COUNT; i++)
+        lv_obj_set_style_border_width(sb[i].box, flash_btn == i ? 3 : 0, 0);
+    if (!have)
+        snprintf(help, sizeof help, "Waiting for the song... This page needs the newer keyboard firmware.");
+    else if (playing)
+        snprintf(help, sizeof help, "The keyboard plays. Go to the SONG page and tap STOP. Then you can edit.");
+    else
+        snprintf(help, sizeof help, "Pick a line. Then set its part and its bars. SAVE SONG keeps it after power-off.");
+    if (strcmp(help, edit_help_shown)) {
+        snprintf(edit_help_shown, sizeof edit_help_shown, "%s", help);
+        lv_label_set_text(edit_help, help);
+    }
+    if (edit_note[0])
+        snprintf(info, sizeof info, "%s", edit_note);
+    else if (have)
+        snprintf(info, sizeof info, "%d line%s, %d bars", count, count == 1 ? "" : "s", total);
+    else
+        info[0] = 0;
+    if (strcmp(info, edit_info_shown)) {
+        snprintf(edit_info_shown, sizeof edit_info_shown, "%s", info);
+        lv_label_set_text(edit_info, info);
+    }
+}
+
+static void sb_make(lv_obj_t *pg, int i, int x, int y, int w, int h, const char *txt, const lv_font_t *font);
+
+static void edit_init(lv_obj_t *pg)
+{
+    static const char *const PART[4] = {"A", "B", "C", "D"};
+    static const char *const STEP[4] = {"- 4", "- 1", "+ 1", "+ 4"};
+    text(pg, 12, 16, 130, &lv_font_montserrat_20, 0xFFFFFF, "SONG EDIT");
+    text(pg, 146, 20, SIDE_W - 150, &lv_font_montserrat_14, 0x606060, "tap: cheat sheet");
+    edit_help = text(pg, 12, 48, SIDE_W - 24, &lv_font_montserrat_14, 0xFFC618, "");
+    lv_label_set_long_mode(edit_help, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(edit_help, 52);
+    for (int i = 0; i < SONG_STEPS; i++) {          // two columns of eight lines
+        cell_box[i] = box(pg, 12 + (i / 8) * 126, 104 + (i % 8) * 22, 122, 20, 0x000000);
+        lv_obj_set_style_radius(cell_box[i], 3, 0);
+        cell_lab[i] = lv_label_create(cell_box[i]);
+        lv_obj_set_style_text_font(cell_lab[i], &lv_font_montserrat_14, 0);
+        lv_label_set_text(cell_lab[i], "");
+        lv_obj_align(cell_lab[i], LV_ALIGN_LEFT_MID, 4, 0);
+        cell_state[i] = -1;
+    }
+    sb_make(pg, EB_PREV, 12, 286, 120, 46, LV_SYMBOL_UP "  LINE", &lv_font_montserrat_20);
+    sb_make(pg, EB_NEXT, 140, 286, 120, 46, "LINE  " LV_SYMBOL_DOWN, &lv_font_montserrat_20);
+    text(pg, 12, 338, 120, &lv_font_montserrat_14, COL_DIM, "PART");
+    text(pg, 12, 410, 120, &lv_font_montserrat_14, COL_DIM, "BARS");
+    for (int i = 0; i < 4; i++) {
+        sb_make(pg, EB_PART + i, 12 + i * 63, 356, 59, 46, PART[i], &lv_font_montserrat_20);
+        sb_make(pg, EB_M4 + i, 12 + i * 63, 428, 59, 46, STEP[i], &lv_font_montserrat_20);
+    }
+    sb_make(pg, EB_ADD, 12, 484, 120, 42, "ADD LINE", &lv_font_montserrat_20);
+    sb_make(pg, EB_DEL, 140, 484, 120, 42, "DELETE", &lv_font_montserrat_20);
+    sb_make(pg, EB_SAVE, 12, 534, 160, 42, "SAVE SONG", &lv_font_montserrat_20);
+    edit_info = text(pg, 12, 580, SIDE_W - 24, &lv_font_montserrat_14, 0xFFFFFF, "");
+}
+
+// A side's page: a clear box over it that holds the page's objects, so one flag hides them all
+static lv_obj_t *page_make(lv_obj_t *scr, int x)
+{
+    lv_obj_t *o = lv_obj_create(scr);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_pos(o, x, 0);
+    lv_obj_set_size(o, SIDE_W, DISP_H);
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    return o;
 }
 
 // One vertical bar of the strip: a dark track at x, and in it the fill strip_update() sizes
@@ -290,6 +631,72 @@ static void tick(lv_timer_t *t)
 {
     (void)t;
     uint8_t b = base;
+    // touch: a tap on the left side's title line changes its page; the song page's other taps are its buttons.
+    // The tap that wakes a dimmed screen does only that.
+    {
+        int tx = 0, ty = 0, r = touch_poll(&tx, &ty);
+        if (r >= 0) {
+            if (r && !touch_was) {
+                act = 1;
+                if (!dimmed && tx < SIDE_W && ty < PAGE_TAP_H) {       // the next page: cheat sheet, song, edit
+                    lv_obj_add_flag(page_obj[page], LV_OBJ_FLAG_HIDDEN);
+                    page = (page + 1) % PG_COUNT;
+                    lv_obj_remove_flag(page_obj[page], LV_OBJ_FLAG_HIDDEN);
+                    usb_mirror_live_poll(page != PG_CHEAT);
+                    edit_ask = 0;
+                    edit_note[0] = 0;
+                } else if (!dimmed && page != PG_CHEAT && tx < SIDE_W) {
+                    int first = page == PG_SONG ? 0 : EB_PREV, end = page == PG_SONG ? SB_COUNT : EB_COUNT, hit = -1;
+                    for (int i = first; i < end && hit < 0; i++)
+                        if (tx >= sb[i].x && tx < sb[i].x + sb[i].w && ty >= sb[i].y && ty < sb[i].y + sb[i].h)
+                            hit = i;
+                    if (hit >= 0 && page == PG_SONG)
+                        song_tap(hit);
+                    else if (hit >= 0)
+                        edit_tap(hit);
+                    else if (page == PG_EDIT && ty >= 104 && ty < 104 + 8 * 22 && song_age <= LIVE_OLD) {
+                        int i = ((tx - 12) / 126 ? 8 : 0) + (ty - 104) / 22;      // a tap on a line picks it
+                        if (tx >= 12 && i >= 0 && i < songd[2])
+                            edit_sel = i;
+                    }
+                }
+            }
+            touch_was = r != 0;
+        }
+    }
+    if (live_new) {
+        live_new = 0;
+        live_age = 0;
+    } else if (live_age <= LIVE_OLD) {
+        live_age++;
+    }
+    if (flash_ticks && !--flash_ticks)
+        flash_btn = -1;
+    if (save_ticks && !--save_ticks)
+        save_armed = -1;
+    if (song_new) {                                 // the song order came (a read, or a change's reply)
+        static const char *const WHY[4] = {"", "Not possible here.", "", "Stop the keyboard first."};
+        uint8_t op = songd[0], rc = songd[1];
+        song_new = 0;
+        song_age = 0;
+        if (op && rc)
+            snprintf(edit_note, sizeof edit_note, "%s", WHY[rc & 3]);
+        else if (op == 4)
+            snprintf(edit_note, sizeof edit_note, "Save sent: see the keyboard picture.");
+        else if (op == 2 && edit_sel + 1 < songd[2])
+            edit_sel++;                             // the new line is the one picked
+    } else if (song_age <= LIVE_OLD) {
+        song_age++;
+    }
+    if (page == PG_SONG) {
+        song_update();
+    } else if (page == PG_EDIT) {
+        if (--edit_ask <= 0) {                      // read the order again once a second (the keyboard may change it)
+            edit_ask = 33;
+            edit_cmd(0, 0, 0, 0);
+        }
+        edit_update();
+    }
     // the backlight: dim after DIM_TICKS with nothing played or changed, full again at once
     if (act) {
         act = 0;
@@ -399,7 +806,7 @@ static void tick(lv_timer_t *t)
             lv_obj_set_style_text_color(bar_run, lv_color_hex((f & 4) ? 0xFF3030 : (f & 2) ? 0x30E060 : COL_DIM), 0);
         }
         strip_update(have && stat_len >= ST_STRIP);
-        scale_update(have && stat_len >= ST_LEN);
+        scale_update(have && stat_len >= ST_SCALE);
     }
     if (last_new) {
         char s[48], nm[8];
@@ -492,7 +899,8 @@ static void cheat_sheet(lv_obj_t *scr)
         "\n"
         "TRACK 1 - 4\n"
         "LVL FLT REV DLY";
-    text(scr, 12, 16, SIDE_W - 16, &lv_font_montserrat_20, 0xFFFFFF, "SMK-37  >  SLOOP");
+    text(scr, 12, 16, 180, &lv_font_montserrat_20, 0xFFFFFF, "SMK-37 > SLOOP");
+    text(scr, 188, 20, SIDE_W - 192, &lv_font_montserrat_14, 0x606060, "tap: song");
     lv_obj_t *col = text(scr, 12, 50, 118, &lv_font_montserrat_14, COL_DIM, PRINTED);
     lv_obj_t *col2 = text(scr, 132, 50, SIDE_W - 136, &lv_font_montserrat_14, 0xFFFFFF, SLOOP);
     lv_obj_t *keys = text(scr, 12, 0, SIDE_W - 16, &lv_font_montserrat_14, COL_DIM, COMBO_KEYS);
@@ -539,7 +947,14 @@ void panel_init(void)
 {
     display_lock(-1);
     lv_obj_t *scr = lv_screen_active();
-    cheat_sheet(scr);
+    page_obj[PG_CHEAT] = page_make(scr, 0);
+    cheat_sheet(page_obj[PG_CHEAT]);
+    page_obj[PG_SONG] = page_make(scr, 0);
+    song_init(page_obj[PG_SONG]);
+    lv_obj_add_flag(page_obj[PG_SONG], LV_OBJ_FLAG_HIDDEN);
+    page_obj[PG_EDIT] = page_make(scr, 0);
+    edit_init(page_obj[PG_EDIT]);
+    lv_obj_add_flag(page_obj[PG_EDIT], LV_OBJ_FLAG_HIDDEN);
 
     lbl_range = text(scr, RIGHT_X + 4, 44, SIDE_W - 8, &lv_font_montserrat_20, 0xFFFFFF, "KEYS");
     piano(scr);
@@ -607,6 +1022,24 @@ void panel_set_connected(bool on)
     act = 1;
 }
 
+void panel_live(const uint8_t *d, int n)
+{
+    if (n < LIVE_LEN)
+        return;
+    for (int i = 0; i < LIVE_LEN; i++)
+        live[i] = d[i];
+    live_new = 1;
+}
+
+void panel_song(const uint8_t *d, int n)
+{
+    if (n < SONG_LEN)
+        return;
+    for (int i = 0; i < SONG_LEN; i++)
+        songd[i] = d[i];
+    song_new = 1;
+}
+
 void panel_link(unsigned frames_per_s, unsigned lost)
 {
     link_fps = frames_per_s;
@@ -636,7 +1069,7 @@ void panel_midi(uint8_t status, uint8_t d1, uint8_t d2)
     d1 &= 127;
     d2 &= 127;
     act = 1;
-    if (stat_have && (stat[0] & 1) && stat_len >= ST_LEN) {     // DAW mode: the wheels are MIDI, not SLOOP's
+    if (stat_have && (stat[0] & 1) && stat_len >= ST_SCALE) {     // DAW mode: the wheels are MIDI, not SLOOP's
         if (type == 0xE0) {
             stat[29] = d2;
             stat_new = 1;

@@ -7,6 +7,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "usb/usb_host.h"
@@ -60,6 +61,21 @@ static uint8_t midi_ep, midi_errs;
 static uint16_t midi_mps;
 static usb_transfer_t *midi_x;
 static bool midi_busy;
+
+/* commands to the keyboard: SLOOP's editor LIVE command as SysEx on the MIDI interface's bulk OUT endpoint
+ * (usb_mirror.h). Queued by any task, sent by the client task, one transfer at a time. */
+#define ED_LIVE 77u
+#define ED_SONG 100u
+typedef struct {
+    uint8_t cmd, n, d[10];
+} live_cmd_t;
+static QueueHandle_t cmdq;
+static uint8_t midi_out_ep;         /* 0: none */
+static usb_transfer_t *out_x;
+static bool out_busy;
+static volatile bool live_poll;
+static uint8_t sx[160];             /* a SysEx message being put together from the MIDI IN packets */
+static int sxn;
 
 static void client_cb(const usb_host_client_event_msg_t *msg, void *arg)
 {
@@ -182,11 +198,15 @@ static bool find_midi(const usb_config_desc_t *cfg, uint8_t *num)
                 *num = f->bInterfaceNumber;
         } else if (in_if && d->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
             const usb_ep_desc_t *e = (const usb_ep_desc_t *)d;
-            if ((e->bEndpointAddress & 0x80) && (e->bmAttributes & 3) == 2) {
-                midi_ep = e->bEndpointAddress;
-                midi_mps = e->wMaxPacketSize & 0x7FF;
-                return midi_mps >= 4;
+            if ((e->bmAttributes & 3) != 2)
+                continue;
+            if (!(e->bEndpointAddress & 0x80)) {
+                midi_out_ep = e->bEndpointAddress;      /* (listed before the IN endpoint) */
+                continue;
             }
+            midi_ep = e->bEndpointAddress;
+            midi_mps = e->wMaxPacketSize & 0x7FF;
+            return midi_mps >= 4;
         }
     }
     return false;
@@ -205,6 +225,59 @@ static void midi_submit(void)
     }
 }
 
+static void out_cb(usb_transfer_t *t)
+{
+    (void)t;
+    out_busy = false;
+    in_flight--;
+}
+
+/* one LIVE command: F0 7D 46 4C <ED_LIVE> args F7, as USB-MIDI packets (code index 4: three more bytes of a SysEx;
+ * 5, 6, 7: its last one, two, three bytes) */
+static void live_send(const live_cmd_t *c)
+{
+    uint8_t m[5 + sizeof c->d + 1], *p = out_x->data_buffer;
+    int n = 0, i;
+    m[n++] = 0xF0;
+    m[n++] = 0x7D;
+    m[n++] = 0x46;
+    m[n++] = 0x4C;
+    m[n++] = c->cmd;
+    for (i = 0; i < c->n && i < (int)sizeof c->d; i++)
+        m[n++] = c->d[i] & 0x7F;
+    m[n++] = 0xF7;
+    for (i = 0; i < n; i += 3, p += 4) {
+        int left = n - i;
+        p[0] = left > 3 ? 0x04 : left == 3 ? 0x07 : left == 2 ? 0x06 : 0x05;
+        p[1] = m[i];
+        p[2] = left > 1 ? m[i + 1] : 0;
+        p[3] = left > 2 ? m[i + 2] : 0;
+    }
+    out_x->num_bytes = (int)(p - out_x->data_buffer);
+    if (usb_host_transfer_submit(out_x) == ESP_OK) {
+        out_busy = true;
+        in_flight++;
+    }
+}
+
+/* a byte of the MIDI IN stream that belongs to a SysEx: the editor's LIVE reply goes to the panel */
+static void sysex_byte(uint8_t b)
+{
+    if (b == 0xF0)
+        sxn = 0;
+    if (sxn < (int)sizeof sx)
+        sx[sxn++] = b;
+    if (b == 0xF7) {
+        if (sxn >= 7 && sx[0] == 0xF0 && sx[1] == 0x7D && sx[2] == 0x46 && sx[3] == 0x4C) {
+            if (sx[4] == ED_LIVE)
+                panel_live(sx + 5, sxn - 6);
+            else if (sx[4] == ED_SONG)
+                panel_song(sx + 5, sxn - 6);
+        }
+        sxn = 0;
+    }
+}
+
 /* USB-MIDI event packets, 4 bytes each: the code index (low nibble of byte 0), then the MIDI message */
 static void midi_cb(usb_transfer_t *t)
 {
@@ -219,6 +292,10 @@ static void midi_cb(usb_transfer_t *t)
             if (cin == 0x8 || cin == 0x9 || cin == 0xB || cin == 0xE) {
                 st.midi++;
                 panel_midi(p[1], p[2], p[3]);
+            } else if (cin >= 0x4 && cin <= 0x7) {      /* SysEx: 3 bytes, or its last 1, 2, 3 */
+                int k, nb = cin == 0x4 || cin == 0x7 ? 3 : cin == 0x5 ? 1 : 2;
+                for (k = 0; k < nb; k++)
+                    sysex_byte(p[1 + k]);
             }
         }
     } else if (running && !gone) {
@@ -236,6 +313,10 @@ static void dev_close(void)
     if (dev && midi_busy && !gone) {
         usb_host_endpoint_halt(dev, midi_ep);
         usb_host_endpoint_flush(dev, midi_ep);
+    }
+    if (dev && out_busy && !gone) {
+        usb_host_endpoint_halt(dev, midi_out_ep);
+        usb_host_endpoint_flush(dev, midi_out_ep);
     }
     /* the library still holds transfers: it gives them back (cancelled / no device) through the callbacks */
     for (i = 0; in_flight > 0 && i < 200; i++)
@@ -256,6 +337,13 @@ static void dev_close(void)
         midi_x = NULL;
     }
     midi_busy = false;
+    if (out_x) {
+        usb_host_transfer_free(out_x);
+        out_x = NULL;
+    }
+    out_busy = false;
+    midi_out_ep = 0;
+    sxn = 0;
     if (dev && midi_if >= 0)
         usb_host_interface_release(client, dev, (uint8_t)midi_if);
     midi_if = -1;
@@ -333,6 +421,7 @@ static void dev_open(uint8_t addr)
     {
         uint8_t n = 0;
         midi_errs = 0;
+        midi_out_ep = 0;
         if (!find_midi(cfg, &n)) {
             ESP_LOGW(TAG, "no MIDI interface: the keys and pads panel stays dark");
         } else if (usb_host_interface_claim(client, dev, n, 0) != ESP_OK) {
@@ -346,6 +435,16 @@ static void dev_open(uint8_t addr)
                 midi_x->context = NULL;
                 midi_submit();
                 ESP_LOGI(TAG, "MIDI: interface %d, endpoint %02x, %d bytes", n, midi_ep, midi_mps);
+                if (midi_out_ep && usb_host_transfer_alloc(64, 0, &out_x) == ESP_OK) {
+                    out_x->device_handle = dev;
+                    out_x->bEndpointAddress = midi_out_ep;
+                    out_x->callback = out_cb;
+                    out_x->context = NULL;
+                    ESP_LOGI(TAG, "MIDI out: endpoint %02x (the song page's commands)", midi_out_ep);
+                } else {
+                    out_x = NULL;
+                    ESP_LOGW(TAG, "no MIDI out endpoint: the song page cannot command the keyboard");
+                }
             } else {
                 midi_x = NULL;
                 ESP_LOGW(TAG, "MIDI: no memory for the transfer");
@@ -365,7 +464,7 @@ static void client_task(void *arg)
         .max_num_event_msg = 5,
         .async = {.client_event_callback = client_cb, .callback_arg = NULL},
     };
-    TickType_t last = xTaskGetTickCount(), last1 = last;
+    TickType_t last = xTaskGetTickCount(), last1 = last, lastp = last;
     uint32_t frames1 = 0;
     (void)arg;
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);            /* the library is installed */
@@ -386,6 +485,19 @@ static void client_task(void *arg)
         if (running && want_resync && ctrl_send(0x41, MIRROR_REQ_RESYNC, 0, ifnum)) {
             want_resync = false;
             st.resyncs++;
+        }
+        if (!running || !out_x) {                           /* nobody to tell: old taps are not kept */
+            xQueueReset(cmdq);
+        } else if (!out_busy) {
+            live_cmd_t c;
+            if (xQueueReceive(cmdq, &c, 0) == pdTRUE) {
+                live_send(&c);
+                lastp = xTaskGetTickCount();                /* (its reply is the state) */
+            } else if (live_poll && xTaskGetTickCount() - lastp >= pdMS_TO_TICKS(200)) {
+                static const live_cmd_t STATE = {ED_LIVE, 2, {0, 0}};
+                lastp = xTaskGetTickCount();
+                live_send(&STATE);
+            }
         }
         if (xTaskGetTickCount() - last1 >= pdMS_TO_TICKS(1000)) {    /* the panel's link line */
             last1 = xTaskGetTickCount();
@@ -429,8 +541,32 @@ static void lib_task(void *arg)
     }
 }
 
+void usb_mirror_live(const uint8_t *args, int n)
+{
+    usb_mirror_cmd(ED_LIVE, args, n);
+}
+
+void usb_mirror_cmd(uint8_t cmd, const uint8_t *args, int n)
+{
+    live_cmd_t c = {0};
+    if (!cmdq || n < 1 || n > (int)sizeof c.d)
+        return;
+    c.cmd = cmd;
+    c.n = (uint8_t)n;
+    memcpy(c.d, args, (size_t)n);
+    if (xQueueSend(cmdq, &c, 0) == pdTRUE && client)
+        usb_host_client_unblock(client);                    /* (the client task sends it now) */
+}
+
+void usb_mirror_live_poll(bool on)
+{
+    live_poll = on;
+}
+
 void usb_mirror_start(void)
 {
+    cmdq = xQueueCreate(8, sizeof(live_cmd_t));
+    assert(cmdq);
     dec = heap_caps_calloc(1, sizeof *dec, MALLOC_CAP_SPIRAM);
     assert(dec);
     md_init(dec);

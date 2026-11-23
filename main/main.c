@@ -9,6 +9,7 @@
 #include "display.h"
 #include "view.h"
 #include "panel.h"
+#include "touch.h"
 #include "usb_mirror.h"
 
 static const char *TAG = "main";
@@ -54,6 +55,7 @@ void app_main(void)
     display_init();
     view_init();
     panel_init();
+    touch_init();
 
     uint16_t *shadow = heap_caps_malloc(VIEW_SRC_W * VIEW_SRC_H * 2, MALLOC_CAP_SPIRAM);
     assert(shadow);

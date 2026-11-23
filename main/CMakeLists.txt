@@ -1,8 +1,8 @@
 idf_component_register(
-    SRCS "main.c" "display_p4.c" "lvgl_mem.c" "view.c" "panel.c" "usb_mirror.c" "mirror_decode.c"
+    SRCS "main.c" "display_p4.c" "lvgl_mem.c" "view.c" "panel.c" "touch.c" "usb_mirror.c" "mirror_decode.c"
     INCLUDE_DIRS "."
     REQUIRES lvgl esp_lcd esp_lcd_jd9165 esp_driver_ledc esp_driver_ppa esp_driver_gpio esp_hw_support esp_mm
-             esp_timer esp_psram usb)
+             esp_timer esp_psram esp_driver_i2c usb)
 
 # display_p4.c's frame copies use esp_lcd's 2D-DMA copy (esp_async_fbcpy), whose header is esp_lcd's own
 target_include_directories(${COMPONENT_LIB} PRIVATE "$ENV{IDF_PATH}/components/esp_lcd/priv_include")
