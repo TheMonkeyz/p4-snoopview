@@ -45,16 +45,21 @@
 enum { LIT_OFF, LIT_T1, LIT_T2, LIT_T3, LIT_T4, LIT_OTHER, LIT_PLAIN };
 static const uint32_t LIT_COL[] = {0, 0x287CFF, 0x1ECC70, 0xFFC618, 0xFF621A, 0x9A9A9A, 0xFF8000};
 // mirror_proto.h MIRROR_STATUS_LEN: flags track low bpm(2) ch[4] dawch | head plen steps(2) page dial[4] fader[4]
-// fbank master batt (the part after | from a version 3 firmware)
-#define ST_LEN      26
+// fbank master batt | scale(2) root bend mod (the parts after the first | from a version 3 firmware)
+#define ST_LEN      31
+#define ST_STRIP    26                      // the strip's part is there from this length on
 #define ST_MIN      10
+
+#define DIM_TICKS   (5 * 60 * 1000 / 30)    // 5 minutes of 30 ms ticks with nothing played: the backlight dims
+#define DIM_LEVEL   30                      // of 255
 
 #define STRIP_X     SIDE_W                  // the strip under the picture: 480 x 60
 #define STRIP_Y     540
 #define STRIP_BAR_Y 6
 #define STRIP_BAR_H 30
 #define STRIP_CAP_Y 40
-#define NBARS       9                       // dials 1-4, faders 1-4, the volume
+#define NBARS       11                      // dials 1-4, faders 1-4, the volume, the pitch wheel, the mod wheel
+#define BAR_PITCH   9                       // (drawn from the middle: 64 is at rest)
 #define COL_WHITE   0xC8C8C8
 #define COL_BLACK   0x181818
 #define COL_PAD     0x2A2A2A
@@ -82,6 +87,13 @@ static volatile uint8_t note_on[128], pad_on[NPADS];
 static volatile uint8_t base = BASE_DEF, last[3], last_new;
 static volatile uint8_t stat[ST_LEN], stat_have, stat_new;   // the keyboard's 'S' record
 static volatile uint8_t stat_len;                   // how much of it the keyboard sent
+static volatile uint8_t act;                        // something was played or changed since the last tick
+static volatile unsigned link_fps, link_lost;
+static volatile uint8_t link_new;
+static lv_obj_t *key_dot[NKEYS], *lbl_link, *lbl_scale;
+static uint8_t dot_shown[NKEYS];                    // 0 hidden, 1 in the scale, 2 its root
+static int idle_ticks;
+static bool dimmed;
 static lv_obj_t *strip, *step_obj[16], *bar_fill[NBARS], *bat_obj[3], *cap_steps, *cap_fad;
 static uint32_t step_col[16];
 static int bar_h[NBARS];
@@ -169,21 +181,59 @@ static void strip_update(bool have)
     lv_label_set_text(cap_steps, s);
     lv_label_set_text(cap_fad, BANK[stat[23] & 3]);
     for (int i = 0; i < NBARS; i++) {
-        uint8_t v = i < 4 ? stat[15 + i] : i < 8 ? stat[19 + (i - 4)] : stat[24];
-        int h = v > 127 ? -1 : 1 + v * (STRIP_BAR_H - 1) / 127;     // (0 still shows a line; -1: no value here)
+        uint8_t v = i < 4 ? stat[15 + i] : i < 8 ? stat[19 + (i - 4)] : i == 8 ? stat[24] :
+                    stat_len >= ST_LEN ? stat[29 + (i - 9)] : 0xFF;
+        // h: 1..30 from the bottom (0 still shows a line), -1 no value here. The pitch wheel: from the middle,
+        // up or down; kept as 1000 + its value so a change is seen.
+        int h = v > 127 ? -1 : i == BAR_PITCH ? 1000 + v : 1 + v * (STRIP_BAR_H - 1) / 127;
         if (h == bar_h[i])
             continue;
         bar_h[i] = h;
         if (h < 0) {
             lv_obj_add_flag(bar_fill[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_remove_flag(bar_fill[i], LV_OBJ_FLAG_HIDDEN);
+        if (i == BAR_PITCH) {
+            int mid = STRIP_BAR_H / 2, d = ((int)v - 64) * mid / 64;
+            lv_obj_set_height(bar_fill[i], d > 0 ? d + 1 : -d + 1);
+            lv_obj_set_y(bar_fill[i], d > 0 ? mid - d : mid);
         } else {
-            lv_obj_remove_flag(bar_fill[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_height(bar_fill[i], h);
             lv_obj_set_y(bar_fill[i], STRIP_BAR_H - h);
         }
     }
     for (int i = 0; i < 3; i++)
         lv_obj_set_style_bg_color(bat_obj[i], lv_color_hex(i < (stat[25] & 3) ? 0x30E060 : 0x303030), 0);
+}
+
+// The scale on the piano: a dot on every key in the selected track's scale, the root's in red. LVGL task.
+static void scale_update(bool have)
+{
+    static const char *const NAME[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    unsigned mask = stat[26] | (unsigned)stat[27] << 8;
+    char s[24] = "";
+    // what the dots mean, beside "KEYS": the root and how many notes; all twelve: no dots, and it says why
+    if (have && mask == 0xFFF)
+        snprintf(s, sizeof s, "scale: all notes");
+    else if (have && mask)
+        snprintf(s, sizeof s, "scale: %s, %d notes", NAME[stat[28] % 12], __builtin_popcount(mask));
+    lv_label_set_text(lbl_scale, s);
+    if (!have || mask == 0xFFF)                     // (every note: nothing to tell)
+        mask = 0;
+    for (int i = 0; i < NKEYS; i++) {
+        int pc = i % 12;                            // (the piano starts on a C)
+        uint8_t want = !((mask >> pc) & 1) ? 0 : pc == stat[28] ? 2 : 1;
+        if (want == dot_shown[i])
+            continue;
+        dot_shown[i] = want;
+        if (!want) {
+            lv_obj_add_flag(key_dot[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(key_dot[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(key_dot[i], lv_color_hex(want == 2 ? 0xFF2020 : key_black[i] ? 0xB0B0B0 : 0x505050), 0);
+        }
+    }
 }
 
 // One vertical bar of the strip: a dark track at x, and in it the fill strip_update() sizes
@@ -201,24 +251,30 @@ static void strip_init(lv_obj_t *scr)
     lv_obj_set_size(strip, 480, 60);
     lv_obj_remove_flag(strip, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     for (int i = 0; i < 16; i++) {
-        step_obj[i] = box(strip, 4 + i * 15, STRIP_BAR_Y, 12, STRIP_BAR_H, 0x383838);
+        step_obj[i] = box(strip, 4 + i * 13, STRIP_BAR_Y, 10, STRIP_BAR_H, 0x383838);
         lv_obj_set_style_radius(step_obj[i], 2, 0);
         step_col[i] = 0x383838;
     }
-    cap_steps = text(strip, 4, STRIP_CAP_Y, 240, &lv_font_montserrat_14, COL_DIM, "STEPS");
+    cap_steps = text(strip, 4, STRIP_CAP_Y, 208, &lv_font_montserrat_14, COL_DIM, "STEPS");
     for (int i = 0; i < 4; i++) {                   // the dials and the faders: SLOOP's four colours
-        bar_fill[i] = strip_bar(256 + i * 15, LIT_COL[LIT_T1 + i]);
-        bar_fill[4 + i] = strip_bar(326 + i * 15, LIT_COL[LIT_T1 + i]);
+        bar_fill[i] = strip_bar(222 + i * 14, LIT_COL[LIT_T1 + i]);
+        bar_fill[4 + i] = strip_bar(290 + i * 14, LIT_COL[LIT_T1 + i]);
     }
-    bar_fill[8] = strip_bar(404, 0xFFFFFF);
+    bar_fill[8] = strip_bar(368, 0xFFFFFF);
+    bar_fill[9] = strip_bar(404, 0x40C8FF);         // the pitch wheel
+    bar_fill[10] = strip_bar(418, 0x40C8FF);        // the mod wheel
     for (int i = 0; i < NBARS; i++)
         bar_h[i] = 1;
-    text(strip, 256, STRIP_CAP_Y, 66, &lv_font_montserrat_14, COL_DIM, "DIALS");
-    cap_fad = text(strip, 326, STRIP_CAP_Y, 70, &lv_font_montserrat_14, COL_DIM, "FAD");
-    text(strip, 398, STRIP_CAP_Y, 36, &lv_font_montserrat_14, COL_DIM, "VOL");
+    // the captions: at least 8 px between two of them; VOL and WHL centred under their bars
+    text(strip, 222, STRIP_CAP_Y, 62, &lv_font_montserrat_14, COL_DIM, "DIALS");
+    cap_fad = text(strip, 290, STRIP_CAP_Y, 62, &lv_font_montserrat_14, COL_DIM, "FAD");
+    lv_obj_t *cv = text(strip, 357, STRIP_CAP_Y, 32, &lv_font_montserrat_14, COL_DIM, "VOL");
+    lv_obj_t *cw = text(strip, 400, STRIP_CAP_Y, 32, &lv_font_montserrat_14, COL_DIM, "WHL");
+    lv_obj_set_style_text_align(cv, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_align(cw, LV_TEXT_ALIGN_CENTER, 0);
     for (int i = 0; i < 3; i++)
-        bat_obj[i] = box(strip, 438 + i * 12, STRIP_BAR_Y + 10, 10, 16, 0x303030);
-    text(strip, 438, STRIP_CAP_Y, 40, &lv_font_montserrat_14, COL_DIM, "BAT");
+        bat_obj[i] = box(strip, 442 + i * 12, STRIP_BAR_Y + 10, 10, 16, 0x303030);
+    text(strip, 442, STRIP_CAP_Y, 38, &lv_font_montserrat_14, COL_DIM, "BAT");
     lv_obj_add_flag(strip, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -234,6 +290,24 @@ static void tick(lv_timer_t *t)
 {
     (void)t;
     uint8_t b = base;
+    // the backlight: dim after DIM_TICKS with nothing played or changed, full again at once
+    if (act) {
+        act = 0;
+        idle_ticks = 0;
+        if (dimmed) {
+            dimmed = false;
+            display_brightness(255);
+        }
+    } else if (!dimmed && ++idle_ticks > DIM_TICKS) {
+        dimmed = true;
+        display_brightness(DIM_LEVEL);
+    }
+    if (link_new) {
+        char s[40];
+        link_new = 0;
+        snprintf(s, sizeof s, "LINK  %u frames/s   lost %u", link_fps, link_lost);
+        lv_label_set_text(lbl_link, s);
+    }
     // the chord held (every channel but the pads')
     {
         uint16_t mask = 0;
@@ -324,7 +398,8 @@ static void tick(lv_timer_t *t)
             lv_label_set_text(bar_run, (f & 4) ? "REC" : (f & 2) ? "PLAY" : "STOP");
             lv_obj_set_style_text_color(bar_run, lv_color_hex((f & 4) ? 0xFF3030 : (f & 2) ? 0x30E060 : COL_DIM), 0);
         }
-        strip_update(have && stat_len >= ST_LEN);
+        strip_update(have && stat_len >= ST_STRIP);
+        scale_update(have && stat_len >= ST_LEN);
     }
     if (last_new) {
         char s[48], nm[8];
@@ -452,6 +527,12 @@ static void piano(lv_obj_t *scr)
         key_obj[i] = box(scr, PIANO_X + white * WHITE_W - BLACK_W / 2 - 1, PIANO_Y, BLACK_W, BLACK_H, COL_BLACK);
         key_x[i] = (uint16_t)(white * WHITE_W - 1 - ROLL_BAR / 2);
     }
+    for (int i = 0; i < NKEYS; i++) {               // the scale's dots (scale_update), near the keys' lower ends
+        key_dot[i] = key_black[i] ? box(key_obj[i], 2, BLACK_H - 10, 4, 4, 0xB0B0B0)
+                                  : box(key_obj[i], 3, WHITE_H - 11, 5, 5, 0x505050);
+        lv_obj_set_style_radius(key_dot[i], 2, 0);
+        lv_obj_add_flag(key_dot[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 void panel_init(void)
@@ -506,6 +587,9 @@ void panel_init(void)
     bar_run = text(scr, BAR_X + 390, BAR_Y, 82, &lv_font_montserrat_20, COL_DIM, "");
     lv_obj_set_style_text_align(bar_run, LV_TEXT_ALIGN_RIGHT, 0);
     strip_init(scr);
+    lbl_link = text(scr, RIGHT_X + 4, 12, SIDE_W - 8, &lv_font_montserrat_14, 0x606060, "");
+    lbl_scale = text(scr, RIGHT_X + 150, 49, SIDE_W - 154, &lv_font_montserrat_14, COL_DIM, "");
+    lv_obj_set_style_text_align(lbl_scale, LV_TEXT_ALIGN_RIGHT, 0);
     stat_new = 1;                                   // (hides them)
     lv_timer_create(tick, 30, NULL);
     display_unlock();
@@ -520,6 +604,14 @@ void panel_set_connected(bool on)
     base = BASE_DEF;
     stat_have = 0;
     stat_new = 1;
+    act = 1;
+}
+
+void panel_link(unsigned frames_per_s, unsigned lost)
+{
+    link_fps = frames_per_s;
+    link_lost = lost;
+    link_new = 1;
 }
 
 void panel_status(const uint8_t *s, int len)
@@ -529,6 +621,7 @@ void panel_status(const uint8_t *s, int len)
     for (int i = 0; i < ST_LEN; i++)
         stat[i] = s[i];
     stat_len = (uint8_t)(len > ST_LEN ? ST_LEN : len);
+    act = 1;
     stat_have = 1;
     stat_new = 1;
     int b = (s[2] & 127) / 12 * 12;                 // the piano starts on a C: the one at or under the lowest key
@@ -542,6 +635,16 @@ void panel_midi(uint8_t status, uint8_t d1, uint8_t d2)
     uint8_t type = status & 0xF0, ch = status & 15;
     d1 &= 127;
     d2 &= 127;
+    act = 1;
+    if (stat_have && (stat[0] & 1) && stat_len >= ST_LEN) {     // DAW mode: the wheels are MIDI, not SLOOP's
+        if (type == 0xE0) {
+            stat[29] = d2;
+            stat_new = 1;
+        } else if (type == 0xB0 && d1 == 1) {
+            stat[30] = d2;
+            stat_new = 1;
+        }
+    }
     if (type == 0x90 || type == 0x80) {
         uint8_t on = type == 0x90 && d2 != 0, lit = LIT_PLAIN;
         bool daw = stat_have && (stat[0] & 1);

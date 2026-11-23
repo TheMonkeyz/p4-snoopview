@@ -365,7 +365,8 @@ static void client_task(void *arg)
         .max_num_event_msg = 5,
         .async = {.client_event_callback = client_cb, .callback_arg = NULL},
     };
-    TickType_t last = xTaskGetTickCount();
+    TickType_t last = xTaskGetTickCount(), last1 = last;
+    uint32_t frames1 = 0;
     (void)arg;
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);            /* the library is installed */
     ESP_ERROR_CHECK(usb_host_client_register(&cc, &client));
@@ -385,6 +386,14 @@ static void client_task(void *arg)
         if (running && want_resync && ctrl_send(0x41, MIRROR_REQ_RESYNC, 0, ifnum)) {
             want_resync = false;
             st.resyncs++;
+        }
+        if (xTaskGetTickCount() - last1 >= pdMS_TO_TICKS(1000)) {    /* the panel's link line */
+            last1 = xTaskGetTickCount();
+            if (st.frames < frames1)
+                frames1 = 0;                                /* (a new device: the counters started again) */
+            if (running)
+                panel_link((unsigned)(st.frames - frames1), (unsigned)dec->lost);
+            frames1 = st.frames;
         }
         if (running && xTaskGetTickCount() - last >= pdMS_TO_TICKS(5000)) {
             last = xTaskGetTickCount();

@@ -13,3 +13,5 @@ void panel_set_connected(bool on);          // off: every key and pad goes dark.
 // keyboard, the rest 0): the track colours, the piano's octave, the status bar over the picture and, from a
 // version 3 firmware, the strip under it (steps, dials, faders, volume, battery). Any task; no lock taken.
 void panel_status(const uint8_t *s, int len);
+// The link's health, once a second: frames shown in that second, packets lost since the keyboard was plugged in.
+void panel_link(unsigned frames_per_s, unsigned lost);
