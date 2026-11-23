@@ -1,11 +1,13 @@
 // The side panels (panel.h). The picture is 480 wide in the middle of 1024: 272 px are free on each side.
 // panel_midi() runs in the USB task and only records what is on; a 30 ms LVGL timer (the LVGL task, display lock
 // held by it) recolours the keys that changed, so no lock is taken from the USB task and nothing is held for long.
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include "panel.h"
 #include "display.h"
 #include "lvgl.h"
+#include "esp_heap_caps.h"
 
 #define SIDE_W      272
 #define RIGHT_X     (DISP_W - SIDE_W)
@@ -24,6 +26,14 @@
 #define PAD_GAP     3
 #define PADS_X      (RIGHT_X + 5)           // 8 x 30 + 7 x 3 = 261
 #define PADS_Y      270
+
+#define CHORD_Y     198                     // between the piano and the pads
+#define LAST_Y      344
+#define ROLL_X      PIANO_X                 // the note history: under each key, the newest at the top
+#define ROLL_Y      396
+#define ROLL_W      (22 * WHITE_W)
+#define ROLL_H      192                     // rows, one each 30 ms tick: 5.8 s
+#define ROLL_BAR    6                       // a note's width
 
 #define DRUM_CH     9                       // MIDI channel 10: the pads, until the keyboard's status names the drum channel
 
@@ -46,6 +56,14 @@ static const uint8_t LANE_NOTE[NPADS] = {36, 35, 38, 39, 42, 46, 44, 37, 40, 43,
 
 static lv_obj_t *key_obj[NKEYS], *pad_obj[NPADS], *lbl_range, *lbl_last;
 static lv_obj_t *bar_mode, *bar_track, *bar_bpm, *bar_run;
+static lv_obj_t *lbl_chord, *pad_name[NPADS], *roll_img;
+static uint16_t *roll_pix;                          // ROLL_W x ROLL_H RGB565, PSRAM
+static lv_image_dsc_t roll_dsc;
+static uint16_t roll_col[sizeof LIT_COL / sizeof LIT_COL[0]];
+static uint16_t key_x[NKEYS];                       // a key's bar in the history, from ROLL_X
+static int roll_busy;                               // rows that still hold a note
+static uint16_t chord_mask = 0xFFFF;                // the pitch classes last named (0xFFFF: none yet)
+static uint8_t chord_bass = 0xFF;
 static uint8_t key_black[NKEYS];
 static uint8_t key_shown[NKEYS], pad_shown[NPADS];  // what is drawn (LVGL task)
 
@@ -86,10 +104,87 @@ static void note_name(char *dst, size_t n, int note)
     snprintf(dst, n, "%s%d", NAME[note % 12], note / 12 - 1);
 }
 
+// The chord of the pitch classes in mask (bit 0 = C), bass the lowest note's class: "C maj7", "A min / C"; "" when
+// fewer than three classes or none of the shapes below fits. The bass is tried first as the root (C6 before Am7).
+static void chord_name(char *dst, size_t n, uint16_t mask, int bass)
+{
+    static const struct { uint16_t shape; const char *name; } CH[] = {
+        {0x091, "maj"}, {0x089, "min"}, {0x049, "dim"}, {0x111, "aug"}, {0x085, "sus2"}, {0x0A1, "sus4"},
+        {0x491, "7"}, {0x891, "maj7"}, {0x489, "min7"}, {0x889, "min maj7"}, {0x449, "min7 b5"}, {0x249, "dim7"},
+        {0x291, "6"}, {0x289, "min6"}, {0x095, "add9"}, {0x08D, "min add9"}, {0x495, "9"}, {0x895, "maj9"},
+        {0x48D, "min9"}, {0x4A1, "7 sus4"},
+    };
+    static const char *const NAME[12] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+    dst[0] = 0;
+    if (__builtin_popcount(mask) < 3)
+        return;
+    for (int k = 0; k < 12; k++) {
+        int root = (bass + k) % 12;
+        if (!((mask >> root) & 1))
+            continue;
+        uint16_t rel = (uint16_t)(((mask >> root) | (mask << (12 - root))) & 0xFFF);
+        for (size_t i = 0; i < sizeof CH / sizeof CH[0]; i++)
+            if (CH[i].shape == rel) {
+                if (root == bass) snprintf(dst, n, "%s %s", NAME[root], CH[i].name);
+                else snprintf(dst, n, "%s %s / %s", NAME[root], CH[i].name, NAME[bass]);
+                return;
+            }
+    }
+}
+
+static void roll_changed(void)
+{
+#if LV_CACHE_DEF_SIZE > 0
+    lv_image_cache_drop(&roll_dsc);
+#endif
+    lv_obj_invalidate(roll_img);
+}
+
 static void tick(lv_timer_t *t)
 {
     (void)t;
     uint8_t b = base;
+    // the chord held (every channel but the pads')
+    {
+        uint16_t mask = 0;
+        int bass = -1;
+        for (int n = 0; n < 128; n++)
+            if (note_on[n]) {
+                mask |= (uint16_t)(1u << (n % 12));
+                if (bass < 0)
+                    bass = n % 12;
+            }
+        if (mask != chord_mask || (uint8_t)bass != chord_bass) {
+            char s[32];
+            chord_mask = mask;
+            chord_bass = (uint8_t)bass;
+            chord_name(s, sizeof s, mask, bass < 0 ? 0 : bass);
+            lv_label_set_text(lbl_chord, s);
+        }
+    }
+    // the note history: one row a tick, while a note sounds or is still on its way down
+    if (b != base_shown && roll_busy) {             // the keys moved under it: start again
+        memset(roll_pix, 0, (size_t)ROLL_W * ROLL_H * 2);
+        roll_busy = 0;
+        roll_changed();
+    }
+    {
+        bool any = false;
+        for (int i = 0; i < NKEYS && !any; i++)
+            any = b + i < 128 && note_on[b + i];
+        if (any || roll_busy) {
+            memmove(roll_pix + ROLL_W, roll_pix, (size_t)ROLL_W * (ROLL_H - 1) * 2);
+            memset(roll_pix, 0, (size_t)ROLL_W * 2);
+            for (int i = 0; i < NKEYS; i++) {
+                uint8_t on = b + i < 128 ? note_on[b + i] : 0;
+                if (on)
+                    for (int x = 0; x < ROLL_BAR; x++)
+                        roll_pix[key_x[i] + x] = roll_col[on];
+            }
+            roll_busy = any ? ROLL_H : roll_busy - 1;
+            roll_changed();
+        }
+    }
     if (b != base_shown) {
         char lo[8], hi[8], s[32];
         base_shown = b;
@@ -122,6 +217,10 @@ static void tick(lv_timer_t *t)
         for (int i = 0; i < 4; i++) {
             if (have) lv_obj_remove_flag(all[i], LV_OBJ_FLAG_HIDDEN);
             else lv_obj_add_flag(all[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        for (int i = 0; i < NPADS; i++) {            // the drum names: not DAW mode's pads
+            if (have && (f & 1)) lv_obj_add_flag(pad_name[i], LV_OBJ_FLAG_HIDDEN);
+            else lv_obj_remove_flag(pad_name[i], LV_OBJ_FLAG_HIDDEN);
         }
         if (have) {
             lv_label_set_text(bar_mode, (f & 1) ? "DAW" : "SYNTH");
@@ -250,6 +349,7 @@ static void piano(lv_obj_t *scr)
         if (key_black[i])
             continue;
         key_obj[i] = box(scr, PIANO_X + white * WHITE_W, PIANO_Y, WHITE_W - 1, WHITE_H, COL_WHITE);
+        key_x[i] = (uint16_t)(white * WHITE_W + (WHITE_W - 1 - ROLL_BAR) / 2);
         white++;
     }
     white = 0;
@@ -259,6 +359,7 @@ static void piano(lv_obj_t *scr)
             continue;
         }
         key_obj[i] = box(scr, PIANO_X + white * WHITE_W - BLACK_W / 2 - 1, PIANO_Y, BLACK_W, BLACK_H, COL_BLACK);
+        key_x[i] = (uint16_t)(white * WHITE_W - 1 - ROLL_BAR / 2);
     }
 }
 
@@ -275,9 +376,38 @@ void panel_init(void)
         int col = i % 8, row = i < 8 ? 1 : 0;       // lanes 0-7: the bottom row
         pad_obj[i] = box(scr, PADS_X + col * (PAD_SZ + PAD_GAP), PADS_Y + row * (PAD_SZ + PAD_GAP), PAD_SZ, PAD_SZ, COL_PAD);
         lv_obj_set_style_radius(pad_obj[i], 4, 0);
+        // the drum it plays (sloop-fm1 firmware/src/drums.c LANE_NAME, two letters: the pad is 30 px)
+        static const char *const LANE2[NPADS] = {"KK", "K2", "SN", "CP", "HH", "OH", "PH", "RM",
+                                                 "S2", "LT", "HT", "CR", "RD", "SH", "CG", "CB"};
+        pad_name[i] = lv_label_create(pad_obj[i]);
+        lv_obj_set_style_text_font(pad_name[i], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pad_name[i], lv_color_hex(0xE0E0E0), 0);
+        lv_label_set_text(pad_name[i], LANE2[i]);
+        lv_obj_center(pad_name[i]);
     }
-    text(scr, RIGHT_X + 4, 360, SIDE_W - 8, &lv_font_montserrat_14, COL_DIM, "LAST MIDI");
-    lbl_last = text(scr, RIGHT_X + 4, 380, SIDE_W - 8, &lv_font_montserrat_14, 0xFFFFFF, "-");
+    text(scr, RIGHT_X + 4, CHORD_Y + 4, 60, &lv_font_montserrat_14, COL_DIM, "CHORD");
+    lbl_chord = text(scr, RIGHT_X + 66, CHORD_Y, SIDE_W - 70, &lv_font_montserrat_20, 0xFFFFFF, "");
+    text(scr, RIGHT_X + 4, LAST_Y, SIDE_W - 8, &lv_font_montserrat_14, COL_DIM, "LAST MIDI");
+    lbl_last = text(scr, RIGHT_X + 4, LAST_Y + 18, SIDE_W - 8, &lv_font_montserrat_14, 0xFFFFFF, "-");
+
+    // the note history: a picture this file draws into (as view.c's), under the keys
+    const size_t n = (size_t)ROLL_W * ROLL_H * 2;
+    roll_pix = heap_caps_aligned_alloc(64, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(roll_pix);
+    memset(roll_pix, 0, n);
+    for (size_t i = 1; i < sizeof LIT_COL / sizeof LIT_COL[0]; i++)
+        roll_col[i] = lv_color_to_u16(lv_color_hex(LIT_COL[i]));
+    roll_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    roll_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    roll_dsc.header.w = ROLL_W;
+    roll_dsc.header.h = ROLL_H;
+    roll_dsc.header.stride = ROLL_W * 2;
+    roll_dsc.data_size = n;
+    roll_dsc.data = (const uint8_t *)roll_pix;
+    roll_img = lv_image_create(scr);
+    lv_image_set_src(roll_img, &roll_dsc);
+    lv_obj_set_pos(roll_img, ROLL_X, ROLL_Y);
+    lv_obj_set_size(roll_img, ROLL_W, ROLL_H);
     // the status bar: hidden until the keyboard sends its first status (an older firmware sends none)
     bar_mode = text(scr, BAR_X + 8, BAR_Y, 100, &lv_font_montserrat_20, 0xFFFFFF, "");
     bar_track = text(scr, BAR_X + 118, BAR_Y, 120, &lv_font_montserrat_20, 0xFFFFFF, "");
