@@ -6,6 +6,7 @@
 #include <string.h>
 #include "panel.h"
 #include "touch.h"
+#include "lesson.h"
 #include "usb_mirror.h"
 #include "display.h"
 #include "lvgl.h"
@@ -99,8 +100,7 @@ static lv_obj_t *key_dot[NKEYS], *lbl_link, *lbl_scale;
 // pixels) changes the page; on the song page the other taps are its buttons.
 #define PAGE_TAP_H  46
 #define LY_SONG     7                       // sloop-fm1 seq.c: the SAVE layer, whose keys the song page presses
-enum { SB_PLAY, SB_REC, SB_PART, SB_SAVE = SB_PART + 4, SB_SREC = SB_SAVE + 4, SB_LOOP, SB_SONG, SB_UNDO, SB_COUNT,
-       // the SONG EDIT page's buttons, in the same table
+enum { // (the song page's buttons, SB_*: lesson.h) the SONG EDIT page's buttons, in the same table
        EB_PREV = SB_COUNT, EB_NEXT, EB_PART, EB_M4 = EB_PART + 4, EB_M1, EB_P1, EB_P4, EB_ADD, EB_DEL, EB_SAVE, EB_COUNT };
 enum { PG_CHEAT, PG_SONG, PG_EDIT, PG_COUNT };
 #define ED_SONG     100                     // usb_mirror.h: the song order command
@@ -123,6 +123,8 @@ static int song_age = 1000, edit_sel, edit_ask;     // ticks since the last orde
 static int cell_state[SONG_STEPS];                  // what a cell shows, packed (edit_update)
 static char edit_help_shown[160], edit_info_shown[64], edit_note[64];
 static int flash_btn = -1, flash_ticks;             // the button just tapped: a white frame for a moment
+static uint8_t sb_frame[SB_COUNT];                  // a song button's frame as drawn: 0 none, 1 white, 2 the lesson's
+static unsigned blink;                              // ticks, for the lesson's frame
 static int save_armed = -1, save_ticks;             // SAVE tapped on a used part: the second tap replaces it
 // the keyboard's live state (editor_live.c ed_live): op flags flags2 bpm(2) playing+1 asked+1 chain_n chain_i mutes
 // solos rec sel fx cpu song_entry song_entries song_bar song_bars stored ...
@@ -288,6 +290,22 @@ static void live_key(int key)               // a key of the SAVE layer, down and
 static void song_tap(int b)
 {
     uint8_t d[2];
+    if (b == SB_LESSON) {                   // LESSON / EXIT
+        if (lesson_active()) lesson_stop();
+        else lesson_start();
+        blink = 0;
+    } else if (lesson_active()) {           // the lesson: only the buttons of its step work
+        bool start = lesson_step() == 0;
+        if (!((lesson_allowed() >> b) & 1))
+            return;
+        lesson_tap(b);
+        blink = 0;
+        if (start) {                        // (UNDO reads START there: no undo)
+            flash_btn = b;
+            flash_ticks = 8;
+            return;
+        }
+    }
     flash_btn = b;
     flash_ticks = 8;
     if (b == SB_PLAY) {
@@ -338,6 +356,16 @@ static void sb_set(int i, uint32_t bg, uint32_t fg, const char *txt)
     }
 }
 
+// A song button's frame: white (the tap just made, the part asked for) or the lesson's yellow one, which blinks
+static void sb_border(int i, int kind)
+{
+    if (sb_frame[i] == kind)
+        return;
+    sb_frame[i] = (uint8_t)kind;
+    lv_obj_set_style_border_color(sb[i].box, lv_color_hex(kind == 2 ? 0xFFC618 : 0xFFFFFF), 0);
+    lv_obj_set_style_border_width(sb[i].box, kind == 2 ? 4 : kind ? 3 : 0, 0);
+}
+
 // The buttons, the help line and the info line from the live state. LVGL task, every tick while the page shows.
 static void song_update(void)
 {
@@ -348,26 +376,34 @@ static void song_update(void)
     int now = have ? live[5] - 1 : -1, next = have ? live[6] - 1 : -1, nstored = __builtin_popcount(stored);
     char help[160], info[64], t[16];
     static const char *const PART[4] = {"A", "B", "C", "D"};
+    lesson_in_t in = {have, playing, rec, srec, song_mode, song_plays, stored};
+    lesson_update(&in);
+    bool les = lesson_active();
+    uint32_t frames = les && have && blink++ % 16 < 10 ? lesson_frames() : 0;
 
     sb_set(SB_PLAY, playing ? 0x30E060 : 0x3A3A3A, playing ? 0x000000 : 0xFFFFFF, playing ? "STOP" : "PLAY");
     sb_set(SB_REC, rec ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, rec ? "REC ON" : "REC");
     for (int i = 0; i < 4; i++) {
         bool used = (stored >> i) & 1;
         sb_set(SB_PART + i, !used ? 0x242424 : i == now ? LIT_COL[LIT_T1 + i] : 0x2A3A4A, !used ? 0x606060 : i == now ? 0x000000 : 0xFFFFFF, NULL);
-        lv_obj_set_style_border_width(sb[SB_PART + i].box, i == next || flash_btn == SB_PART + i ? 3 : 0, 0);
         snprintf(t, sizeof t, save_armed == i ? "%s ?" : "%s", PART[i]);
         sb_set(SB_SAVE + i, save_armed == i ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, t);
     }
     sb_set(SB_SREC, srec ? 0xFF3030 : 0x3A3A3A, 0xFFFFFF, srec ? "STOP SONG REC" : "SONG REC");
     sb_set(SB_LOOP, !song_mode ? 0xFFFFFF : 0x3A3A3A, !song_mode ? 0x000000 : 0xFFFFFF, NULL);
     sb_set(SB_SONG, song_mode ? 0xFFFFFF : 0x3A3A3A, song_mode ? 0x000000 : 0xFFFFFF, NULL);
-    for (int i = 0; i < SB_COUNT; i++)
-        if (i < SB_PART || i >= SB_PART + 4)
-            lv_obj_set_style_border_width(sb[i].box, flash_btn == i ? 3 : 0, 0);
+    sb_set(SB_UNDO, 0x3A3A3A, 0xFFFFFF, les && lesson_step() == 0 ? "START" : "UNDO");
+    sb_set(SB_LESSON, les ? 0xFFC618 : 0x3A3A3A, les ? 0x000000 : 0xFFFFFF, les ? "EXIT" : "LESSON");
+    for (int i = 0; i < SB_COUNT; i++) {
+        bool part_next = i >= SB_PART && i < SB_PART + 4 && i - SB_PART == next;
+        sb_border(i, (frames >> i) & 1 ? 2 : flash_btn == i || part_next ? 1 : 0);
+    }
 
     // what to do next, in plain words
     if (!have)
         snprintf(help, sizeof help, "Waiting for the keyboard...");
+    else if (les)
+        lesson_text(help, sizeof help);
     else if (save_armed >= 0)
         snprintf(help, sizeof help, "Part %s is used. Tap SAVE %s again now to replace it. This cannot be undone.", PART[save_armed], PART[save_armed]);
     else if (srec && playing)
@@ -440,6 +476,7 @@ static void song_init(lv_obj_t *pg)
     sb_make(pg, SB_LOOP, 12, 440, 120, 48, "LOOP", &lv_font_montserrat_20);
     sb_make(pg, SB_SONG, 140, 440, 120, 48, "SONG", &lv_font_montserrat_20);
     sb_make(pg, SB_UNDO, 12, 500, 120, 44, "UNDO", &lv_font_montserrat_20);
+    sb_make(pg, SB_LESSON, 140, 500, 120, 44, "LESSON", &lv_font_montserrat_20);
     song_info = text(pg, 12, 560, SIDE_W - 24, &lv_font_montserrat_14, 0xFFFFFF, "");
 }
 
@@ -639,6 +676,8 @@ static void tick(lv_timer_t *t)
             if (r && !touch_was) {
                 act = 1;
                 if (!dimmed && tx < SIDE_W && ty < PAGE_TAP_H) {       // the next page: cheat sheet, song, edit
+                    if (lesson_active())                                // (the lesson stays on its page: EXIT first)
+                        goto touched;
                     lv_obj_add_flag(page_obj[page], LV_OBJ_FLAG_HIDDEN);
                     page = (page + 1) % PG_COUNT;
                     lv_obj_remove_flag(page_obj[page], LV_OBJ_FLAG_HIDDEN);
@@ -661,6 +700,7 @@ static void tick(lv_timer_t *t)
                     }
                 }
             }
+        touched:
             touch_was = r != 0;
         }
     }
