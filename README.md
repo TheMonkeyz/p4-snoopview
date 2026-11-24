@@ -60,6 +60,19 @@ bootloader at 0x2000 on the P4; 40m is what this build's `build\p4\flash_args` s
 
     esptool.exe --chip esp32p4 -p COM7 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 40m --flash_size 16MB 0x2000 build\p4\bootloader\bootloader.bin 0x8000 build\p4\partition_table\partition-table.bin 0x10000 build\p4\snoopview.bin
 
+## Web installer
+
+https://themonkeyz.github.io/p4-snoopview/ installs the firmware from Chrome or Edge (ESP Web Tools, through the
+"Full Speed USB" port). `.github/workflows/pages.yml` builds each push to `main` and publishes the site: the page is
+`web/flash/index.html`, and `tools/make_site.py` adds the build's images and the manifest. To see the site on the PC:
+`python tools\make_site.py --build build\p4 --out _site`, then `python -m http.server -d _site` and open
+http://localhost:8000/.
+
+The keyboard's firmware (Snoop37 with `SNOOP_MIRROR=1`) has its own installer page, from the fork
+`TheMonkeyz/sloop-fm1` (branch `snoop37-mirror`; the built site is its `gh-pages` branch):
+https://themonkeyz.github.io/sloop-fm1/. Connect the SMK-37 Pro to the computer, open that page in Chrome or Edge,
+then Open the installer and Install.
+
 ## What you should see
 
 - Screen: black, a 480x480 test pattern in the middle (8 colour bars, a grey ramp, then a 1-pixel checker, 1-pixel

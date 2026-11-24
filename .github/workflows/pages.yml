@@ -1,0 +1,73 @@
+# The web installer (GitHub Pages): https://themonkeyz.github.io/p4-snoopview/
+#
+#  push to main  -> build the firmware, run the host test, publish the installer site with that build.
+#  pull request  -> build and test only; nothing is published.
+#  Run workflow  -> the same as a push to main.
+#
+# The site is web/flash/* plus the build's images and an ESP Web Tools manifest (tools/make_site.py).
+# Actions are pinned to commit SHAs (the comment says which tag), as in esp32-s3-meteobus.
+#
+# One-time setup on GitHub: Settings -> Pages -> Build and deployment -> Source = "GitHub Actions".
+name: Installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0            # tags, for git describe
+
+      - name: Version
+        id: ver
+        run: |
+          v=$(git describe --tags --always)
+          echo "$v" > version.txt   # ESP-IDF uses version.txt as the app version (boot log)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Host test (the lesson)
+        run: sh test/run.sh
+
+      - name: Build (ESP-IDF v5.5.4, same as the PC builds)
+        uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d  # v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32p4
+          path: "."
+          command: idf.py build
+
+      - name: Site
+        run: |
+          sudo chown -R "$(id -u)" build
+          python3 tools/make_site.py --build build --out _site --version "${{ steps.ver.outputs.version }}"
+          ls -l _site _site/firmware
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
+        with:
+          path: _site
+
+  pages:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5

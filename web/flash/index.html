@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snoopview – Web Installer</title>
+<meta name="description" content="Install snoopview on a Guition JC1060P470C (ESP32-P4) from your browser: the Snoop37 keyboard's screen at 2x on a 7 inch panel.">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='6' width='28' height='20' rx='3' fill='%23000' stroke='%23384452' stroke-width='2'/%3E%3Crect x='11' y='11' width='10' height='10' fill='%23ff9a3d'/%3E%3C/svg%3E">
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+:root{--bg:#000;--card:#0e131a;--line:#1d2631;--line2:#2a3542;--text:#f2f5f8;--body:#c3ccd6;--dim:#8e9aa9;
+  --accent:#ff9a3d;--link:#5ab0ff;--warn:#ffc83d;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--body);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1,h2{color:var(--text);font-weight:600;margin:0}
+h1{font-size:clamp(36px,6vw,56px);line-height:1.05;letter-spacing:-.02em;margin-bottom:14px}
+h2{font-size:20px;margin-bottom:12px}
+p{margin:0 0 12px}
+a{color:var(--link);text-underline-offset:3px}
+b{color:var(--text);font-weight:600}
+code{font:14px ui-monospace,Consolas,monospace;color:var(--text);background:#1a222c;border-radius:5px;padding:1px 6px}
+:focus-visible{outline:2px solid var(--link);outline-offset:3px;border-radius:6px}
+.wrap{max-width:860px;margin:0 auto;padding:0 24px 64px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:20px 0}
+.brand{display:inline-flex;align-items:center;gap:10px;color:var(--text);font-size:15px}
+.brand::before{content:"";width:12px;height:12px;background:var(--accent);box-shadow:0 0 0 3px #000,0 0 0 4px #384452}
+.gh{font-size:14px;color:var(--dim);text-decoration:none;padding:6px 12px;border:1px solid var(--line2);border-radius:999px}
+.gh:hover{color:var(--text)}
+.eyebrow{display:block;color:var(--accent);font-size:13px;letter-spacing:.12em;text-transform:uppercase;margin:28px 0 10px}
+.lead{font-size:18px;max-width:36em;margin-bottom:28px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 22px 18px;margin-bottom:18px}
+.install{border-color:rgba(255,154,61,.45);box-shadow:0 30px 60px -40px rgba(255,154,61,.5)}
+.ver{color:var(--dim);font-size:14px;min-height:1.6em;margin-bottom:14px}
+esp-web-install-button{display:block}
+esp-web-install-button button{width:100%;min-height:56px;padding:14px 24px;border:0;border-radius:14px;cursor:pointer;
+  color:#1d0f00;background:linear-gradient(180deg,#ffb469,#ff9a3d);font:600 17px/1.2 inherit}
+esp-web-install-button button:hover{filter:brightness(1.07)}
+esp-web-install-button:not(:defined) [slot=unsupported],esp-web-install-button:not(:defined) [slot=not-allowed]{display:none}
+.msg{display:block;padding:12px 14px;border-radius:12px;background:#1f1a0c;border:1px solid #4a3d15;color:#f4e3b5}
+.note{font-size:14px;color:var(--dim);margin:14px 0 0}
+ol,ul{margin:0;padding-left:1.3em}
+li{margin-bottom:8px}
+li:last-child{margin-bottom:0}
+footer{color:var(--dim);font-size:14px;margin-top:28px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <span class="brand">snoopview</span>
+    <a class="gh" href="https://github.com/TheMonkeyz/p4-snoopview">GitHub</a>
+  </header>
+
+  <main>
+    <span class="eyebrow">Web installer</span>
+    <h1>The Snoop37 screen, on a big screen</h1>
+    <p class="lead">snoopview shows the Snoop37 keyboard's 240&times;240 screen at exact 2&times; on a 7" ESP32-P4 panel, with
+      a piano, the pads, a cheat sheet and song pages on the sides. Install it from this page: no tools to set up.</p>
+
+    <section class="card install" aria-labelledby="h-install">
+      <h2 id="h-install">Install</h2>
+      <p class="ver" id="ver">&nbsp;</p>
+      <esp-web-install-button manifest="firmware/manifest.json">
+        <button slot="activate">Connect and install</button>
+        <span slot="unsupported" class="msg">This browser cannot talk to a USB serial port. Use <b>Chrome</b> or
+          <b>Edge</b> on a computer (Windows, macOS or Linux).</span>
+        <span slot="not-allowed" class="msg">The installer needs a secure page. Open this page over <b>https</b>.</span>
+      </esp-web-install-button>
+      <p class="note">This replaces the firmware on the board. snoopview saves nothing on the board, so there is nothing to
+        lose from an older snoopview.</p>
+    </section>
+
+    <section class="card" aria-labelledby="h-need">
+      <h2 id="h-need">What you need</h2>
+      <ul>
+        <li>A <b>Guition JC1060P470C</b> board (ESP32-P4, 7" 1024&times;600 panel). The firmware is for this board only.</li>
+        <li>A USB-C data cable.</li>
+        <li>Chrome or Edge on a computer.</li>
+      </ul>
+    </section>
+
+    <section class="card" aria-labelledby="h-steps">
+      <h2 id="h-steps">Steps</h2>
+      <ol>
+        <li>Connect the computer to the board's <b>"Full Speed USB"</b> port.</li>
+        <li>Click <b>Connect and install</b>.</li>
+        <li>Select the port named <b>USB JTAG/serial debug unit</b>, then click <b>Connect</b>.</li>
+        <li>Click <b>Install snoopview</b>. Wait until it says the installation is complete (about one minute).</li>
+        <li>The board restarts. You see a test pattern and <b>waiting for snoop37</b>.</li>
+        <li>Connect the keyboard to the board's <b>"High speed USB"</b> port. The keyboard's screen comes on the panel.</li>
+      </ol>
+      <p class="note">If the port does not show, or the installation does not start: hold the board's <b>BOOT</b> button,
+        press <b>RESET</b>, release <b>BOOT</b>, then try again. Press <b>RESET</b> after the installation.</p>
+    </section>
+
+    <section class="card" aria-labelledby="h-kbd">
+      <h2 id="h-kbd">The keyboard's firmware</h2>
+      <p>The keyboard (M-Vave SMK-37 Pro) must run Snoop37 with the screen mirror. Other firmwares do not send the
+        screen: the panel stays on the test pattern. Install it one time, from the fork's page:</p>
+      <ol>
+        <li>Connect the keyboard to the <b>computer</b> with a USB data cable. Close other apps that use MIDI.</li>
+        <li>Open <a href="https://themonkeyz.github.io/sloop-fm1/">themonkeyz.github.io/sloop-fm1</a> in Chrome or
+          Edge.</li>
+        <li>Click <b>Open the installer</b>, then <b>Install</b>. Let the browser use the MIDI devices.</li>
+        <li>Do not unplug the cable while it writes. The keyboard restarts when it is done.</li>
+        <li>Connect the keyboard to the board's <b>"High speed USB"</b> port.</li>
+      </ol>
+      <p class="note" style="margin-bottom:12px">Projects, presets, samples and settings stay on the keyboard. It is an
+        experimental firmware, not from M-Vave: you install it at your own risk. That page also says how to go back.</p>
+      <p style="margin:0">More about the board's ports, the pages and the printed screen clips:
+        <a href="https://github.com/TheMonkeyz/p4-snoopview#readme">the README</a>.</p>
+    </section>
+  </main>
+
+  <footer>snoopview is not a product of Guition or Espressif. The installer uses
+    <a href="https://esphome.github.io/esp-web-tools/">ESP Web Tools</a>.</footer>
+</div>
+<script>
+// version.json = {version, built}, written by tools/make_site.py
+fetch('version.json', {cache: 'no-cache'}).then(r => r.ok ? r.json() : null).then(v => {
+  if (!v) return;
+  const el = document.getElementById('ver');
+  el.textContent = 'Version ';
+  const b = document.createElement('b');
+  b.textContent = v.version;
+  el.append(b, ', built ' + v.built);
+}).catch(() => {});
+</script>
+</body>
+</html>
