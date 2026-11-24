@@ -21,6 +21,7 @@ descriptors. The USB receive code and the stream decoder come later.
 | `main/mirror_decode.c/.h`, `mirror_proto.h` | the stream decoder and wire format, copied from `sloop-fm1` (`tools/mirror`, `firmware/src/mirror_proto.h`) |
 | `main/main.c` | Display, view, the test pattern (`view_test_pattern()`: colour bars, grey ramp, 1-pixel checker / lines; shown again when the keyboard is unplugged), then the USB spike |
 | `main/Kconfig.projbuild` | Panel V2 (default on), USB host controller (HS default), optional VBUS enable GPIO (none) |
+| `case/` | two printed clips that hold the screen on the rear edge of the SMK-37: see [case/README.md](case/README.md) |
 
 ## The board's USB-C ports
 
